@@ -1,0 +1,30 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Data / runtime
+/data
+*.db
+*.log
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# BGV governance (local only)
+.bgv
+.bgv/
+.githooks/
+CLAUDE.md
+AGENTS.md
+MEMORY.md
