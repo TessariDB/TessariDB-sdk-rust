@@ -1,0 +1,43 @@
+[package]
+name = "bgv-db-sdk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+description = "Async client for bgv-db"
+repository = "https://github.com/BoogVAr/bgv-db-sdk-rust"
+publish = false
+
+[dependencies]
+# The runtime is a declared dependency, not an incidental one (ADR-SDK-0003).
+# `io-util` for the read/write halves, `net` for TcpStream, `macros`+`rt` so a
+# caller that has no runtime of its own can still be handed one in tests.
+tokio = { version = "1", default-features = false, features = [
+    "io-util",
+    "net",
+    "rt",
+    "macros",
+] }
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time"] }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# A client parses bytes from a stranger. These three are the lints that catch the
+# ways that goes wrong, and they are denied rather than warned.
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+arithmetic_side_effects = "deny"
+missing_errors_doc = "allow"
+module_name_repetitions = "allow"

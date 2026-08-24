@@ -6,19 +6,66 @@ This is the library you use to talk to a bgv-db node: run statements, subscribe
 to changes, store and fetch files, and check whether a node is healthy — without
 writing HTTP by hand.
 
-Licence: **LicenseRef-bgv-db-Commercial**. See [`LICENSE`](LICENSE). This is
-proprietary software; it is not open source.
+Licence: **Apache-2.0**. See [`LICENSE`](LICENSE). Permissive, with an explicit
+patent grant — the licence a client library you embed in your own product should
+carry.
+
+The server is licensed separately. The boundary runs between the two, and this
+client depends on the server's *protocol*, never on its code.
 
 ---
 
 ## Status
 
-**Early.** This repository currently carries its boundary and nothing else.
+**Early.** The wire half works: connect, run statements with bound parameters,
+decode every value type, subscribe to changes. The HTTP half — objects, files,
+backup, health — is next.
 
-The boundary is written first on purpose. An SDK's README is where it is decided
-what the library owns and what it refuses, and that decision is expensive to
-reverse once callers depend on it — so it is made deliberately, in one place,
-rather than emerging from whichever module someone writes first.
+The boundary was written before any code, on purpose. An SDK's README is where it
+is decided what the library owns and what it refuses, and that decision is
+expensive to reverse once callers depend on it — so it is made deliberately, in
+one place, rather than emerging from whichever module someone writes first.
+
+### Written against the protocol, not against the server
+
+This client implements the published protocol specification and takes **no
+dependency on the database's repository** — not by path, not by git, not by a
+published crate. Its whole dependency tree is `tokio` and `thiserror`.
+
+That is what lets the same protocol have a client in any language, and it is why
+a rename inside the server cannot break a client that never used the renamed
+thing.
+
+### It is asynchronous
+
+`async fn` throughout, on Tokio. A change subscription holds a connection open
+for as long as you care to listen, which is the workload a thread is the wrong
+unit for — and it is the workload this client exists for.
+
+```rust
+use bgv_db_sdk::{Client, Follow, Value};
+
+let mut client = Client::connect("127.0.0.1:9080").await?;
+
+let answers = client
+    .run_with(
+        "SELECT * FROM users WHERE age > $min;",
+        None,
+        [("min", Value::from(21_i64))],
+    )
+    .await?;
+
+// A subscription consumes the connection: a socket delivering changes is not
+// also answering scripts. Two jobs, two connections.
+let mut feed = Client::connect("127.0.0.1:9080")
+    .await?
+    .follow(&Follow::everything().to_table("users"))
+    .await?;
+
+while let Some(change) = feed.next().await? {
+    println!("{} {} at {}", change.table, change.id, change.sequence);
+}
+```
 
 ## What this SDK is for
 

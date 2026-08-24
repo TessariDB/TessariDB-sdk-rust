@@ -1,0 +1,116 @@
+//! An async client for bgv-db.
+//!
+//! # What this crate is written against
+//!
+//! The **protocol specification**, and nothing else. This client links no crate
+//! from the database's own repository, in this language or any other. What it
+//! depends on is the frame layout, the tag numbers, the version byte and the
+//! value codec — all of which are specified, and the specification is the
+//! interface.
+//!
+//! That is not tidiness. A client that links the server's crates cannot be
+//! written in another language at all, and couples every release of every client
+//! to the server's internal refactorings.
+//!
+//! # Two transports, and the choice is forced
+//!
+//! A node serves two surfaces and neither carries everything. Statements and
+//! subscriptions go over the **wire protocol**, because it carries the store's
+//! full model of fifteen value types. Objects, files, backup and the operational
+//! routes go over **HTTP**, because nothing else serves them.
+//!
+//! A caller never picks a transport per call. Routing statements over HTTP would
+//! work, reach everything, and silently narrow every result — JSON carries six
+//! types — and nothing at the call site would show what was lost.
+//!
+//! This first cut implements the **wire half**.
+//!
+//! # There is no TLS on this protocol
+//!
+//! Credentials travel as they are given. A node belongs on a network you protect
+//! or behind something that terminates TLS. This is said here rather than left to
+//! be discovered.
+//!
+//! # Example
+//!
+//! This is the README's example, kept here so the compiler checks it. A usage
+//! example that lives only in prose is one that drifts.
+//!
+//! ```no_run
+//! # async fn run() -> Result<(), bgv_db_sdk::Error> {
+//! use bgv_db_sdk::{Client, Follow, Value};
+//!
+//! let mut client = Client::connect("127.0.0.1:9080").await?;
+//!
+//! let answers = client
+//!     .run_with(
+//!         "SELECT * FROM users WHERE age > $min;",
+//!         None,
+//!         [("min", Value::from(21_i64))],
+//!     )
+//!     .await?;
+//!
+//! // A subscription consumes the connection: a socket delivering changes is
+//! // not also answering scripts. Two jobs, two connections.
+//! let mut feed = Client::connect("127.0.0.1:9080")
+//!     .await?
+//!     .follow(&Follow::everything().to_table("users"))
+//!     .await?;
+//!
+//! while let Some(change) = feed.next().await? {
+//!     println!("{} {} at {}", change.table, change.id, change.sequence);
+//! }
+//! # Ok(())
+//! # }
+//! ```
+
+#![forbid(unsafe_code)]
+
+pub mod codec;
+pub mod value;
+pub mod wire;
+
+mod client;
+mod error;
+mod feed;
+
+pub use crate::client::Client;
+pub use crate::error::{EncodingFault, Error, Result};
+pub use crate::feed::Feed;
+pub use crate::value::{Number, RecordId, RecordRef, Value, ValueRange};
+pub use crate::wire::message::{Answer, Names, Parameters, Request};
+pub use crate::wire::push::{Became, Change, Follow};
+
+/// The protocol constants.
+///
+/// # The name lives here and only here
+///
+/// [`GREETING`] is four bytes that happen to spell the product's short name.
+/// They are **not required to**: they are an arbitrary magic number whose only
+/// job is to make "this is not one of ours" a clear answer at the first read.
+///
+/// Keeping them in one place is deliberate. A rename of the product must not
+/// become a protocol break, and it only stays cheap while these bytes are a
+/// constant rather than a string typed in several files.
+pub mod protocol {
+    /// What every connection says first, in both directions.
+    pub const GREETING: &[u8; 4] = b"BGVW";
+
+    /// The protocol version this client speaks.
+    ///
+    /// Checked at the greeting so a mismatch is one clear refusal at the start
+    /// rather than a decode failure somewhere in the middle that reads like
+    /// corruption.
+    pub const VERSION: u8 = 3;
+
+    /// The largest frame this client will read — or send.
+    ///
+    /// A declared length above this is refused *before anything is allocated*,
+    /// because a length from a stranger is not a promise. The ceiling applies
+    /// outbound as well: a peer that emits what it would refuse to read is
+    /// running two protocols.
+    pub const CEILING: u32 = 16 * 1024 * 1024;
+
+    /// The fixed size of a frame header: one kind byte and a `u32` length.
+    pub const HEADER: usize = 5;
+}
