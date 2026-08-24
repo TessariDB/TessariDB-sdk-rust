@@ -16,7 +16,7 @@
 //!
 //! A node serves two surfaces and neither carries everything. Statements and
 //! subscriptions go over the **wire protocol**, because it carries the store's
-//! full model of fifteen value types. Objects, files, backup and the operational
+//! full model of seventeen value types. Objects, files, backup and the operational
 //! routes go over **HTTP**, because nothing else serves them.
 //!
 //! A caller never picks a transport per call. Routing statements over HTTP would
@@ -67,6 +67,8 @@
 #![forbid(unsafe_code)]
 
 pub mod codec;
+pub mod geometry;
+pub mod query;
 pub mod value;
 pub mod wire;
 
@@ -77,6 +79,7 @@ mod feed;
 pub use crate::client::Client;
 pub use crate::error::{EncodingFault, Error, Result};
 pub use crate::feed::Feed;
+pub use crate::geometry::{Geometry, Polygon, Position, Ring};
 pub use crate::value::{Number, RecordId, RecordRef, Value, ValueRange};
 pub use crate::wire::message::{Answer, Names, Parameters, Request};
 pub use crate::wire::push::{Became, Change, Follow};
@@ -96,12 +99,21 @@ pub mod protocol {
     /// What every connection says first, in both directions.
     pub const GREETING: &[u8; 4] = b"BGVW";
 
-    /// The protocol version this client speaks.
+    /// The protocol major this client speaks.
     ///
     /// Checked at the greeting so a mismatch is one clear refusal at the start
     /// rather than a decode failure somewhere in the middle that reads like
-    /// corruption.
-    pub const VERSION: u8 = 3;
+    /// corruption. A differing **major** means the bodies are not the same
+    /// protocol and no conversation is possible.
+    pub const MAJOR: u8 = 1;
+
+    /// The protocol minor this client speaks.
+    ///
+    /// A differing minor is **not** a refusal. Each side learns the other's and
+    /// uses it for one thing only: declining to send what an older peer cannot
+    /// read. Decoding is already safe without it — an unknown outcome is stepped
+    /// over by its length, and an unknown frame kind closes the connection.
+    pub const MINOR: u8 = 0;
 
     /// The largest frame this client will read — or send.
     ///
@@ -113,4 +125,11 @@ pub mod protocol {
 
     /// The fixed size of a frame header: one kind byte and a `u32` length.
     pub const HEADER: usize = 5;
+
+    /// The size of the greeting: the magic, then major, then minor.
+    ///
+    /// Its own constant rather than a reuse of [`HEADER`]. The two were the same
+    /// number until the version became two bytes, and a shared constant would
+    /// have made one of them silently wrong.
+    pub const GREETING_BYTES: usize = GREETING.len() + 2;
 }

@@ -18,8 +18,12 @@ client depends on the server's *protocol*, never on its code.
 ## Status
 
 **Early.** The wire half works: connect, run statements with bound parameters,
-decode every value type, subscribe to changes. The HTTP half — objects, files,
-backup, health — is next.
+decode every value type, subscribe to changes, and build the four common
+statements. The HTTP half — objects, files, backup, health — is next.
+
+It implements **protocol 1.0**: a two-number version where only a differing
+major is a refusal, and an outcome kind this build has never seen is stepped over
+by its length rather than ending the read.
 
 The boundary was written before any code, on purpose. An SDK's README is where it
 is decided what the library owns and what it refuses, and that decision is
@@ -96,7 +100,7 @@ A bgv-db node serves two surfaces, and **neither one carries everything**:
 
 That table makes an HTTP-only client look like the obvious choice: it reaches
 every route. It is the trap. HTTP answers are JSON, which carries **six** types,
-while the wire protocol carries the store's full model of **fifteen**. An
+while the wire protocol carries the store's full model of **seventeen**. An
 HTTP-only SDK would therefore work, reach everything, and quietly narrow every
 statement result — invisibly, because a value that has been through JSON is
 still a perfectly valid value, and nothing at the call site shows what was lost.

@@ -30,7 +30,9 @@ use std::ops::Bound;
 use std::path::PathBuf;
 
 use bgv_db_sdk::codec::{decode, encode};
-use bgv_db_sdk::{Number, RecordId, RecordRef, Value, ValueRange};
+use bgv_db_sdk::{
+    Geometry, Number, Polygon, Position, RecordId, RecordRef, Ring, Value, ValueRange,
+};
 use serde_json::Value as Json;
 
 /// Where the corpus lives.
@@ -44,7 +46,7 @@ fn corpus_path() -> PathBuf {
     std::env::var("BGV_PROTOCOL_CORPUS").map_or_else(
         |_| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../bgv-db-protocol/conformance/values-v3.json")
+                .join("../bgv-db-protocol/conformance/values-v1.json")
         },
         PathBuf::from,
     )
@@ -145,7 +147,75 @@ fn value_of(json: &Json) -> Value {
                 .map(value_of)
                 .collect(),
         ),
+        "geometry" => Value::Geometry(geometry_of(held)),
+        "regex" => Value::Regex(held.as_str().expect("a pattern").to_owned()),
         other => panic!("the corpus names a value kind this client has no type for: {other}"),
+    }
+}
+
+/// A coordinate, from the corpus's **bits**.
+///
+/// The corpus writes each coordinate as eight bytes of hex rather than as a
+/// decimal literal, so nothing in this path depends on two languages agreeing
+/// about how to parse `2.3522` — which they do, but which would be an
+/// unnecessary thing for a byte-level corpus to rest on.
+fn position_of(json: &Json) -> Position {
+    let longitude = u64::from_str_radix(json["lon"].as_str().expect("hex bits"), 16).expect("u64");
+    let latitude = u64::from_str_radix(json["lat"].as_str().expect("hex bits"), 16).expect("u64");
+    Position::new(f64::from_bits(longitude), f64::from_bits(latitude))
+}
+
+fn positions_of(json: &Json) -> Vec<Position> {
+    json.as_array()
+        .expect("positions are an array")
+        .iter()
+        .map(position_of)
+        .collect()
+}
+
+fn polygon_of(json: &Json) -> Polygon {
+    Polygon {
+        exterior: Ring(positions_of(&json["exterior"])),
+        interiors: json["interiors"]
+            .as_array()
+            .expect("interiors are an array")
+            .iter()
+            .map(|ring| Ring(positions_of(ring)))
+            .collect(),
+    }
+}
+
+fn geometry_of(json: &Json) -> Geometry {
+    let object = json.as_object().expect("a geometry is an object");
+    assert_eq!(object.len(), 1, "a geometry is exactly one tagged key");
+    let (kind, held) = object.iter().next().expect("one entry");
+    match kind.as_str() {
+        "point" => Geometry::Point(position_of(held)),
+        "line" => Geometry::Line(positions_of(held)),
+        "polygon" => Geometry::Polygon(polygon_of(held)),
+        "multipoint" => Geometry::MultiPoint(positions_of(held)),
+        "multiline" => Geometry::MultiLine(
+            held.as_array()
+                .expect("lines are an array")
+                .iter()
+                .map(positions_of)
+                .collect(),
+        ),
+        "multipolygon" => Geometry::MultiPolygon(
+            held.as_array()
+                .expect("polygons are an array")
+                .iter()
+                .map(polygon_of)
+                .collect(),
+        ),
+        "collection" => Geometry::Collection(
+            held.as_array()
+                .expect("a collection is an array")
+                .iter()
+                .map(|one| Box::new(geometry_of(one)))
+                .collect(),
+        ),
+        other => panic!("the corpus names a shape this client has no type for: {other}"),
     }
 }
 
@@ -202,21 +272,21 @@ fn every_corpus_vector_encodes_and_decodes_exactly() {
             "the conformance corpus is required, not optional — a suite that \
              passes having found nothing reports coverage it does not have.\n\
              tried: {}\n{why}\n\
-             set BGV_PROTOCOL_CORPUS to point at values-v3.json",
+             set BGV_PROTOCOL_CORPUS to point at values-v1.json",
             path.display()
         )
     });
     let document: Json = serde_json::from_str(&raw).expect("the corpus is JSON");
 
     assert_eq!(
-        document["protocol_version"].as_u64(),
-        Some(3),
-        "this client implements version 3"
+        document["protocol_major"].as_u64(),
+        Some(u64::from(bgv_db_sdk::protocol::MAJOR)),
+        "this client implements a different major from the corpus"
     );
 
     let cases = document["cases"].as_array().expect("the corpus has cases");
     assert!(
-        cases.len() >= 30,
+        cases.len() >= 50,
         "the corpus shrank to {} cases — a suite cannot get stronger by losing vectors",
         cases.len()
     );

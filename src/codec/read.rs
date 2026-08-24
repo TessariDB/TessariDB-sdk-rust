@@ -8,9 +8,10 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 
 use crate::codec::{
-    ESCAPE, ESCAPED_ZERO, TERMINATOR, bound_kind, number_kind, record_id_kind, tag,
+    ESCAPE, ESCAPED_ZERO, TERMINATOR, bound_kind, number_kind, record_id_kind, shape_kind, tag,
 };
 use crate::error::EncodingFault;
+use crate::geometry::{Geometry, Polygon, Position, Ring};
 use crate::value::{Number, RecordId, RecordRef, Value, ValueRange};
 
 /// How deep a nested value may go before this client refuses it.
@@ -184,6 +185,85 @@ impl<'a> Reader<'a> {
                     items.push(self.take_value(deeper)?);
                 }
                 Ok(Value::Set(items))
+            }
+            tag::GEOMETRY => Ok(Value::Geometry(self.take_geometry(deeper)?)),
+            tag::REGEX => Ok(Value::Regex(self.take_text()?)),
+            unknown => Err(EncodingFault::UnknownTag { tag: unknown }),
+        }
+    }
+
+    /// A coordinate pair, **longitude first**.
+    ///
+    /// Reading them in the other order costs nothing at decode time and is
+    /// undetectable afterwards: both are valid doubles and the resulting point
+    /// is a real place. The corpus pins the byte order for this reason.
+    fn take_position(&mut self) -> Result<Position, EncodingFault> {
+        let longitude = f64::from_bits(u64::from_be_bytes(self.take_fixed::<8>()?));
+        let latitude = f64::from_bits(u64::from_be_bytes(self.take_fixed::<8>()?));
+        Ok(Position::new(longitude, latitude))
+    }
+
+    fn take_positions(&mut self) -> Result<Vec<Position>, EncodingFault> {
+        let count = self.take_count()?;
+        let mut out = Vec::new();
+        for _ in 0..count {
+            out.push(self.take_position()?);
+        }
+        Ok(out)
+    }
+
+    fn take_polygon(&mut self) -> Result<Polygon, EncodingFault> {
+        let exterior = Ring(self.take_positions()?);
+        let count = self.take_count()?;
+        let mut interiors = Vec::new();
+        for _ in 0..count {
+            interiors.push(Ring(self.take_positions()?));
+        }
+        Ok(Polygon {
+            exterior,
+            interiors,
+        })
+    }
+
+    /// A shape, carrying the same depth budget every other value carries.
+    ///
+    /// A collection may hold a collection, so this recurses on network input and
+    /// needs the bound for the same reason `take_value` does: without it, a few
+    /// hundred crafted bytes end the stack, which is a crash rather than an
+    /// error and one no caller can catch.
+    fn take_geometry(&mut self, depth: u32) -> Result<Geometry, EncodingFault> {
+        if depth > MAX_DEPTH {
+            return Err(EncodingFault::Truncated);
+        }
+        let deeper = depth.saturating_add(1);
+        match self.take_u8()? {
+            shape_kind::POINT => Ok(Geometry::Point(self.take_position()?)),
+            shape_kind::LINE => Ok(Geometry::Line(self.take_positions()?)),
+            shape_kind::POLYGON => Ok(Geometry::Polygon(self.take_polygon()?)),
+            shape_kind::MULTI_POINT => Ok(Geometry::MultiPoint(self.take_positions()?)),
+            shape_kind::MULTI_LINE => {
+                let count = self.take_count()?;
+                let mut lines = Vec::new();
+                for _ in 0..count {
+                    lines.push(self.take_positions()?);
+                }
+                Ok(Geometry::MultiLine(lines))
+            }
+            shape_kind::MULTI_POLYGON => {
+                let count = self.take_count()?;
+                let mut polygons = Vec::new();
+                for _ in 0..count {
+                    polygons.push(self.take_polygon()?);
+                }
+                Ok(Geometry::MultiPolygon(polygons))
+            }
+            shape_kind::COLLECTION => {
+                let count = self.take_count()?;
+                let mut shapes = Vec::new();
+                for _ in 0..count {
+                    shapes.push(Box::new(self.take_geometry(deeper)?));
+                }
+                Ok(Geometry::Collection(shapes))
             }
             unknown => Err(EncodingFault::UnknownTag { tag: unknown }),
         }

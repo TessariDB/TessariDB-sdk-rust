@@ -3,8 +3,9 @@
 use std::ops::Bound;
 
 use crate::codec::{
-    ESCAPE, ESCAPED_ZERO, TERMINATOR, bound_kind, number_kind, record_id_kind, tag,
+    ESCAPE, ESCAPED_ZERO, TERMINATOR, bound_kind, number_kind, record_id_kind, shape_kind, tag,
 };
+use crate::geometry::{Geometry, Polygon, Position};
 use crate::value::{Number, RecordId, RecordRef, Value};
 
 /// Encode one value.
@@ -142,6 +143,86 @@ fn put_value(out: &mut Vec<u8>, value: &Value) {
             put_u32(out, count_of(items.len()));
             for item in items {
                 put_value(out, item);
+            }
+        }
+        Value::Geometry(shape) => {
+            out.push(tag::GEOMETRY);
+            put_geometry(out, shape);
+        }
+        Value::Regex(pattern) => {
+            out.push(tag::REGEX);
+            // The pattern as written. Not compiled, not validated: dialects
+            // disagree about what is valid, so a client that checks rejects
+            // patterns the node would have accepted.
+            put_lenbytes(out, pattern.as_bytes());
+        }
+    }
+}
+
+/// A coordinate pair, **longitude first**, each as the double's bits.
+///
+/// Bits rather than any decimal form: a coordinate routed through text is a
+/// different coordinate, and the difference survives every round trip this
+/// client could perform on itself.
+fn put_position(out: &mut Vec<u8>, position: &Position) {
+    out.extend_from_slice(&position.longitude.to_bits().to_be_bytes());
+    out.extend_from_slice(&position.latitude.to_bits().to_be_bytes());
+}
+
+fn put_positions(out: &mut Vec<u8>, positions: &[Position]) {
+    put_u32(out, count_of(positions.len()));
+    for position in positions {
+        put_position(out, position);
+    }
+}
+
+fn put_polygon(out: &mut Vec<u8>, polygon: &Polygon) {
+    put_positions(out, &polygon.exterior.0);
+    put_u32(out, count_of(polygon.interiors.len()));
+    for interior in &polygon.interiors {
+        put_positions(out, &interior.0);
+    }
+}
+
+fn put_geometry(out: &mut Vec<u8>, shape: &Geometry) {
+    match shape {
+        Geometry::Point(position) => {
+            out.push(shape_kind::POINT);
+            put_position(out, position);
+        }
+        Geometry::Line(positions) => {
+            out.push(shape_kind::LINE);
+            put_positions(out, positions);
+        }
+        Geometry::Polygon(polygon) => {
+            out.push(shape_kind::POLYGON);
+            put_polygon(out, polygon);
+        }
+        Geometry::MultiPoint(positions) => {
+            out.push(shape_kind::MULTI_POINT);
+            put_positions(out, positions);
+        }
+        Geometry::MultiLine(lines) => {
+            out.push(shape_kind::MULTI_LINE);
+            put_u32(out, count_of(lines.len()));
+            for line in lines {
+                put_positions(out, line);
+            }
+        }
+        Geometry::MultiPolygon(polygons) => {
+            out.push(shape_kind::MULTI_POLYGON);
+            put_u32(out, count_of(polygons.len()));
+            for polygon in polygons {
+                put_polygon(out, polygon);
+            }
+        }
+        Geometry::Collection(shapes) => {
+            out.push(shape_kind::COLLECTION);
+            put_u32(out, count_of(shapes.len()));
+            for held in shapes {
+                // A whole geometry, kind byte included — which is what lets a
+                // collection hold a collection.
+                put_geometry(out, held);
             }
         }
     }

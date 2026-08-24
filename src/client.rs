@@ -34,7 +34,12 @@ impl Client<TcpStream> {
         // because the peer is waiting for it. Leaving it on adds latency to
         // exactly the pattern this protocol is made of.
         stream.set_nodelay(true)?;
-        frame::greet(&mut stream).await?;
+        // The peer's minor is deliberately dropped here rather than stored.
+        // It decides only what this client may *send* to an older node, and
+        // nothing this build sends is minor-gated yet — a field kept against a
+        // future need would have to be given a value by `with_stream`, which
+        // does not know one, and an invented value is worse than no field.
+        let _peer_minor = frame::greet(&mut stream).await?;
         Ok(Self { stream })
     }
 }
@@ -68,7 +73,7 @@ where
 
     /// Run a script whose parameters take the values bound to them.
     ///
-    /// The values travel in the store's own codec, so all fifteen types cross
+    /// The values travel in the store's own codec, so all seventeen types cross
     /// unchanged and the node never has to *read* one. That is what keeps the
     /// grammar's rule intact at this distance: a supplied value cannot become
     /// syntax, and nothing about being remote gives that back.

@@ -13,16 +13,33 @@
     clippy::expect_used,
     clippy::indexing_slicing
 )]
-use bgv_db_sdk::protocol::{CEILING, GREETING, VERSION};
+use bgv_db_sdk::protocol::{CEILING, GREETING, MAJOR, MINOR};
 use bgv_db_sdk::wire::frame::{self, Kind};
 use bgv_db_sdk::wire::message::decode_answers;
 use bgv_db_sdk::{Answer, Client, Error, Number, Request, Value};
 use tokio::io::AsyncWriteExt;
 
-/// An answer frame body carrying `count` outcomes.
-fn answer_body(outcomes: &[u8], count: u32) -> Vec<u8> {
+/// One outcome, behind the `u32` length the protocol puts in front of it.
+///
+/// Written as a helper rather than inline in each test because the length is
+/// exactly what a hand-built body forgets, and forgetting it would make every
+/// test below fail in the same confusing place.
+fn outcome(tagged: &[u8]) -> Vec<u8> {
+    let mut out = u32::try_from(tagged.len())
+        .expect("a test outcome is small")
+        .to_be_bytes()
+        .to_vec();
+    out.extend_from_slice(tagged);
+    out
+}
+
+/// An answer frame body carrying these outcomes, in order.
+fn answer_body(outcomes: &[Vec<u8>]) -> Vec<u8> {
+    let count = u32::try_from(outcomes.len()).expect("a test answer is small");
     let mut body = count.to_be_bytes().to_vec();
-    body.extend_from_slice(outcomes);
+    for one in outcomes {
+        body.extend_from_slice(one);
+    }
     body
 }
 
@@ -106,23 +123,46 @@ async fn a_greeting_from_something_that_is_not_a_node_is_refused() {
 }
 
 #[tokio::test]
-async fn a_node_of_another_version_is_refused_at_the_greeting() {
+async fn a_node_of_another_major_is_refused_at_the_greeting() {
     let (mut ours, mut theirs) = tokio::io::duplex(64);
     tokio::spawn(async move {
         let mut said = GREETING.to_vec();
-        said.push(VERSION.saturating_add(1));
+        said.push(MAJOR.saturating_add(1));
+        said.push(MINOR);
         theirs.write_all(&said).await.ok();
     });
     let error = frame::greet(&mut ours)
         .await
-        .expect_err("a version mismatch must be refused here, not later");
+        .expect_err("a major mismatch must be refused here, not later");
     match error {
         Error::WrongVersion { found, supported } => {
-            assert_eq!(found, VERSION.saturating_add(1));
-            assert_eq!(supported, VERSION);
+            assert_eq!(found, MAJOR.saturating_add(1));
+            assert_eq!(supported, MAJOR);
         }
         other => panic!("expected WrongVersion, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_node_of_a_later_minor_is_accepted_and_its_minor_reported() {
+    // The half of the version rule that is easy to get wrong in the safe-looking
+    // direction: refusing a differing minor would compile, pass every other test
+    // here, and quietly make every upgrade a breaking one.
+    let (mut ours, mut theirs) = tokio::io::duplex(64);
+    tokio::spawn(async move {
+        let mut said = GREETING.to_vec();
+        said.push(MAJOR);
+        said.push(MINOR.saturating_add(9));
+        theirs.write_all(&said).await.ok();
+    });
+    let heard = frame::greet(&mut ours)
+        .await
+        .expect("a differing minor is not a refusal");
+    assert_eq!(
+        heard,
+        MINOR.saturating_add(9),
+        "the peer's minor is what decides what we may send it"
+    );
 }
 
 #[tokio::test]
@@ -139,10 +179,10 @@ async fn a_script_is_sent_and_its_answers_read_back() {
         assert_eq!(kind, Kind::Request);
 
         // Two outcomes: Done, then Removed(7).
-        let mut outcomes = vec![0_u8];
-        outcomes.push(4);
-        outcomes.extend_from_slice(&7_u64.to_be_bytes());
-        frame::write(&mut theirs, Kind::Answer, &answer_body(&outcomes, 2))
+        let mut removed = vec![4_u8];
+        removed.extend_from_slice(&7_u64.to_be_bytes());
+        let outcomes = [outcome(&[0_u8]), outcome(&removed)];
+        frame::write(&mut theirs, Kind::Answer, &answer_body(&outcomes))
             .await
             .expect("the node should answer");
         body
@@ -214,36 +254,66 @@ async fn a_refusal_carries_the_nodes_own_words() {
 }
 
 #[test]
-fn an_unknown_outcome_stops_the_read_instead_of_producing_garbage() {
-    // Three outcomes claimed: Done, then an unknown tag whose payload happens to
-    // look like a valid Removed, then a real Done. A decoder that carried on
-    // would read the payload as the next outcome and hand back invented values.
-    let mut outcomes = vec![0_u8, 0xEE];
-    outcomes.extend_from_slice(&99_u64.to_be_bytes());
-    outcomes.push(0);
-    let answers = decode_answers(&answer_body(&outcomes, 3)).expect("this should decode");
+fn an_unknown_outcome_is_stepped_over_and_the_next_one_still_reads() {
+    // The unknown outcome sits in the MIDDLE, and its payload is deliberately a
+    // well-formed `Removed(99)`. A decoder that ignored the length would read
+    // that payload as the next outcome's tag and hand back an invented answer;
+    // one that stopped at the unknown would silently lose the Done after it.
+    let mut strange = vec![0xEE_u8];
+    strange.extend_from_slice(&99_u64.to_be_bytes());
+    let outcomes = [outcome(&[0_u8]), outcome(&strange), outcome(&[0_u8])];
+
+    let answers = decode_answers(&answer_body(&outcomes)).expect("this should decode");
     assert_eq!(
         answers,
-        vec![Answer::Done, Answer::Unknown],
-        "the read must stop at the unknown outcome, with it last"
+        vec![Answer::Done, Answer::Unknown, Answer::Done],
+        "an unknown outcome is skipped by its length, not stopped at"
     );
 }
 
 #[test]
+fn trailing_bytes_inside_a_known_outcome_are_skipped_rather_than_refused() {
+    // What a later minor adding a field to an existing outcome kind looks like
+    // to this build. Refusing here would make such an addition breaking, which
+    // is the opposite of what a minor bump promises.
+    let mut extended = vec![4_u8];
+    extended.extend_from_slice(&7_u64.to_be_bytes());
+    extended.extend_from_slice(b"a field this build has never heard of");
+    let outcomes = [outcome(&extended), outcome(&[0_u8])];
+
+    let answers = decode_answers(&answer_body(&outcomes)).expect("this should decode");
+    assert_eq!(answers, vec![Answer::Removed(7), Answer::Done]);
+}
+
+#[test]
+fn an_outcome_that_claims_more_than_its_length_allows_is_malformed() {
+    // The bound works in the other direction too: a Removed needs eight bytes
+    // after its tag, and this one is given four. Without the bound it would read
+    // into the outcome that follows and answer with a plausible wrong number.
+    let mut short = vec![4_u8];
+    short.extend_from_slice(&[0, 0, 0, 1]);
+    let outcomes = [outcome(&short), outcome(&[0_u8])];
+
+    let error = decode_answers(&answer_body(&outcomes))
+        .expect_err("a body larger than its length must not borrow from the next outcome");
+    assert!(matches!(error, Error::Malformed), "got {error:?}");
+}
+
+#[test]
 fn a_value_outcome_carries_the_names_its_references_need() {
-    let mut outcomes = vec![2_u8];
+    let mut tagged = vec![2_u8];
     // one name: table 3 is "users"
-    outcomes.extend_from_slice(&1_u32.to_be_bytes());
-    outcomes.extend_from_slice(&3_u32.to_be_bytes());
-    outcomes.extend_from_slice(&5_u32.to_be_bytes());
-    outcomes.extend_from_slice(b"users");
+    tagged.extend_from_slice(&1_u32.to_be_bytes());
+    tagged.extend_from_slice(&3_u32.to_be_bytes());
+    tagged.extend_from_slice(&5_u32.to_be_bytes());
+    tagged.extend_from_slice(b"users");
     // the value: integer 1
     let value = bgv_db_sdk::codec::encode(&Value::Number(Number::Integer(1)));
     let value_len = u32::try_from(value.len()).expect("the test value is small");
-    outcomes.extend_from_slice(&value_len.to_be_bytes());
-    outcomes.extend_from_slice(&value);
+    tagged.extend_from_slice(&value_len.to_be_bytes());
+    tagged.extend_from_slice(&value);
 
-    let answers = decode_answers(&answer_body(&outcomes, 1)).expect("this should decode");
+    let answers = decode_answers(&answer_body(&[outcome(&tagged)])).expect("this should decode");
     match answers.first() {
         Some(Answer::Value { value, names }) => {
             assert_eq!(value, &Value::Number(Number::Integer(1)));

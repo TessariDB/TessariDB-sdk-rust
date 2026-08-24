@@ -23,7 +23,10 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 
 use bgv_db_sdk::codec::{decode, encode};
-use bgv_db_sdk::{EncodingFault, Number, RecordId, RecordRef, Value, ValueRange};
+use bgv_db_sdk::{
+    EncodingFault, Geometry, Number, Polygon, Position, RecordId, RecordRef, Ring, Value,
+    ValueRange,
+};
 
 fn round_trip(value: &Value) {
     let bytes = encode(value);
@@ -32,7 +35,7 @@ fn round_trip(value: &Value) {
 }
 
 #[test]
-fn every_one_of_the_fifteen_types_round_trips() {
+fn every_one_of_the_seventeen_types_round_trips() {
     let cases = vec![
         Value::None,
         Value::Null,
@@ -69,10 +72,31 @@ fn every_one_of_the_fifteen_types_round_trips() {
             Bound::Excluded(Value::Number(Number::Integer(9))),
         ))),
         Value::Set(vec![Value::Bool(true)]),
+        Value::Geometry(Geometry::Point(Position::new(2.3522, 48.8566))),
+        // A polygon with a hole: the interior-ring count is the field a codec
+        // written from the point case alone would forget.
+        Value::Geometry(Geometry::Polygon(Polygon {
+            exterior: Ring(vec![
+                Position::new(0.0, 0.0),
+                Position::new(1.0, 0.0),
+                Position::new(1.0, 1.0),
+                Position::new(0.0, 0.0),
+            ]),
+            interiors: vec![Ring(vec![Position::new(0.25, 0.25)])],
+        })),
+        // A collection inside a collection: each member carries its own kind
+        // byte, which is what makes the nesting readable at all.
+        Value::Geometry(Geometry::Collection(vec![Box::new(Geometry::Collection(
+            vec![Box::new(Geometry::Line(vec![
+                Position::new(0.0, 0.0),
+                Position::new(1.0, 1.0),
+            ]))],
+        ))])),
+        Value::Regex("^a.*z$".to_owned()),
     ];
     // A control on the case list itself: a test that silently iterated an empty
     // vector would pass and prove nothing.
-    assert_eq!(cases.len(), 20, "the case list lost entries");
+    assert_eq!(cases.len(), 24, "the case list lost entries");
     for case in &cases {
         round_trip(case);
     }

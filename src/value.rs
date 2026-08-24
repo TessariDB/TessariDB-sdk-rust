@@ -1,6 +1,6 @@
-//! The fifteen types a node carries.
+//! The seventeen types a node carries.
 //!
-//! # Why this is fifteen types and not JSON's six
+//! # Why this is seventeen types and not JSON's six
 //!
 //! The wire protocol exists so that a decimal stays a decimal, a duration stays
 //! a duration, and a record reference stays a reference. Every one of them
@@ -18,6 +18,8 @@
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
+
+use crate::geometry::Geometry;
 
 /// A value, as a node carries it.
 #[derive(Debug, Clone, PartialEq)]
@@ -77,6 +79,15 @@ pub enum Value {
     /// on decode, so a client is not obliged to implement a total order across
     /// mixed types merely to send one.
     Set(Vec<Value>),
+    /// A shape on the sphere.
+    Geometry(Geometry),
+    /// A pattern, as written.
+    ///
+    /// Text rather than a compiled matcher: nothing in the protocol says which
+    /// dialect the pattern is in, and compiling it here would refuse patterns
+    /// the node accepts. The node compiles it, and says so in its own words when
+    /// it cannot.
+    Regex(String),
 }
 
 /// A number, in one of the three shapes the store keeps.

@@ -18,7 +18,7 @@
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{Error, Result};
-use crate::protocol::{CEILING, GREETING, HEADER, VERSION};
+use crate::protocol::{CEILING, GREETING, GREETING_BYTES, HEADER, MAJOR, MINOR};
 
 /// What a frame is.
 ///
@@ -66,34 +66,49 @@ impl Kind {
     }
 }
 
-/// Exchange greetings, refusing anything that is not a node of this version.
+/// Exchange greetings, and return the peer's **minor**.
 ///
 /// Both sides send; both check. Refusing here rather than mid-conversation is
 /// what makes a version mismatch one clear message instead of a decode failure
 /// somewhere in the middle that reads like corruption.
-pub async fn greet<S>(stream: &mut S) -> Result<()>
+///
+/// A differing **major** is that refusal. A differing **minor** is not: the two
+/// sides agree about frames and about every value, and the newer one simply
+/// knows more outcome kinds — which the older one steps over by their lengths.
+/// The peer's minor is returned rather than discarded because it is the only
+/// thing that decides what this client may *send* to an older node.
+pub async fn greet<S>(stream: &mut S) -> Result<u8>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut sent = Vec::with_capacity(HEADER);
+    let mut sent = Vec::with_capacity(GREETING_BYTES);
     sent.extend_from_slice(GREETING);
-    sent.push(VERSION);
+    sent.push(MAJOR);
+    sent.push(MINOR);
     stream.write_all(&sent).await?;
     stream.flush().await?;
 
-    let mut heard = [0_u8; 5];
-    stream.read_exact(&mut heard).await?;
-    let (magic, version) = heard.split_at(GREETING.len());
-    if magic != GREETING.as_slice() {
+    // The magic is read and judged on its own, before the version bytes. A peer
+    // that is not a node owes us nothing and may send four bytes and hang up;
+    // reading all six at once would report that as an unexpected end of file,
+    // which sends the reader to the network for a problem that is an address.
+    let mut magic = [0_u8; 4];
+    stream.read_exact(&mut magic).await?;
+    if magic != *GREETING {
         return Err(Error::NotThisProtocol);
     }
-    match version.first().copied() {
-        Some(VERSION) => Ok(()),
-        Some(found) => Err(Error::WrongVersion {
-            found,
-            supported: VERSION,
-        }),
-        None => Err(Error::Truncated),
+
+    let mut version = [0_u8; 2];
+    stream.read_exact(&mut version).await?;
+    let major = version.first().copied().ok_or(Error::Truncated)?;
+    let minor = version.get(1).copied().ok_or(Error::Truncated)?;
+    if major == MAJOR {
+        Ok(minor)
+    } else {
+        Err(Error::WrongVersion {
+            found: major,
+            supported: MAJOR,
+        })
     }
 }
 

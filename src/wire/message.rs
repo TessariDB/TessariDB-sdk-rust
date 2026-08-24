@@ -164,18 +164,24 @@ pub enum Answer {
 
 /// Read every outcome out of an answer frame's body.
 ///
-/// # An unknown outcome ends the read, and that is a protocol limit not a choice
+/// # Each outcome carries its own length, and that is what makes this safe
 ///
-/// An outcome carries no length of its own, so a tag this build does not know
-/// cannot be *skipped* — there is no way to learn where it ends and the next one
-/// begins. Continuing the loop would decode the unknown outcome's payload as the
-/// next outcome's tag and hand the caller plausible garbage.
+/// An outcome is a `u32` length and then its tagged body. A tag this build does
+/// not know is therefore *skippable*: the reader yields [`Answer::Unknown`],
+/// steps to the end of that outcome, and carries on with the next one. So a
+/// newer node may introduce an outcome kind **anywhere** in an answer without
+/// breaking this client, which is the whole content of the promise that a minor
+/// version bump is compatible.
 ///
-/// So the read stops at the first [`Answer::Unknown`] and returns what it has,
-/// with the `Unknown` last. A caller sees exactly one unknown and knows the
-/// remainder of the frame was not read, rather than receiving invented values
-/// for it. Forward compatibility across outcome kinds therefore holds only while
-/// an unknown outcome is the final one in its answer.
+/// Each outcome is decoded inside a cursor bounded by its own length, so a
+/// recognised outcome cannot read into the next one either — a body that claims
+/// more than its length allows is malformed rather than a mis-parse of
+/// everything after it.
+///
+/// Bytes left over **inside** one outcome are skipped rather than refused. That
+/// is deliberate: it lets a later minor add a trailing field to an outcome kind
+/// this build already knows, and an older client keeps reading the part it
+/// understands.
 pub fn decode_answers(body: &[u8]) -> Result<Vec<Answer>> {
     let mut reader = Body::new(body);
     let count = reader.take_u32()?;
@@ -183,12 +189,10 @@ pub fn decode_answers(body: &[u8]) -> Result<Vec<Answer>> {
     // The count is not used to pre-allocate: it is a stranger's number, and the
     // frame ceiling bounds the bytes rather than the claim.
     for _ in 0..count {
-        let answer = decode_one(&mut reader)?;
-        let stop = answer == Answer::Unknown;
-        answers.push(answer);
-        if stop {
-            break;
-        }
+        let length = reader.take_u32()?;
+        let length = usize::try_from(length).map_err(|_| Error::Malformed)?;
+        let mut outcome = Body::new(reader.take(length)?);
+        answers.push(decode_one(&mut outcome)?);
     }
     Ok(answers)
 }
@@ -230,9 +234,9 @@ fn decode_one(reader: &mut Body<'_>) -> Result<Answer> {
             Ok(Answer::Keys(keys))
         }
         tag::REMOVED => Ok(Answer::Removed(reader.take_u64()?)),
-        // Deliberately consumes nothing further: this build cannot know the
-        // shape of what it does not recognise, so it stops rather than
-        // mis-reading the rest of the frame as the next outcome.
+        // Consumes nothing further, and does not need to: the caller reads this
+        // outcome inside a cursor bounded by its own length and steps to the end
+        // of it either way.
         _ => Ok(Answer::Unknown),
     }
 }

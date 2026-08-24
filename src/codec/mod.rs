@@ -1,4 +1,4 @@
-//! The value codec — protocol version 3.
+//! The value codec — protocol version 1.0.
 //!
 //! # This module's integers are not the frame layer's
 //!
@@ -48,6 +48,22 @@ pub(crate) mod tag {
     pub(crate) const OBJECT: u8 = 0x0d;
     pub(crate) const RANGE: u8 = 0x0e;
     pub(crate) const SET: u8 = 0x0f;
+    pub(crate) const GEOMETRY: u8 = 0x10;
+    pub(crate) const REGEX: u8 = 0x11;
+}
+
+/// Which shape a geometry is.
+///
+/// Permanent for the reason the value tags are: a shape already written carries
+/// this byte.
+pub(crate) mod shape_kind {
+    pub(crate) const POINT: u8 = 0x01;
+    pub(crate) const LINE: u8 = 0x02;
+    pub(crate) const POLYGON: u8 = 0x03;
+    pub(crate) const MULTI_POINT: u8 = 0x04;
+    pub(crate) const MULTI_LINE: u8 = 0x05;
+    pub(crate) const MULTI_POLYGON: u8 = 0x06;
+    pub(crate) const COLLECTION: u8 = 0x07;
 }
 
 /// Which of the three shapes a number takes.
