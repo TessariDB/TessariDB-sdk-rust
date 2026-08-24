@@ -25,17 +25,20 @@
 //! That the text it emits **parses**. That guarantee needs the node's own parser,
 //! which this client deliberately does not depend on.
 //!
-//! Nor can the protocol repository supply it: the specification's §6 puts the
-//! query language explicitly *outside* the protocol, so a rendering corpus has
-//! no home there and a client that put one there would be publishing the
-//! language as though it were the wire format.
+//! Nor does the protocol *specification* supply it: its §6 puts the query
+//! language explicitly outside the protocol, so no section there says what a
+//! rendering must be.
 //!
-//! What stands in its place is two weaker things, and naming them is the point:
-//! `tests/query.rs` pins the exact text of every builder case, so a change to
-//! the rendering is visible in a diff instead of silent; and an acceptance run
-//! against a running node is **owed** and is the only thing that settles whether
-//! the text parses. A grammar change on the node side will not fail anything
-//! here.
+//! A **shared** rendering corpus is still what this needs, because Python and Go
+//! will each want a builder and none of them can link a Rust parser — where that
+//! corpus lives is an open decision, not a settled one.
+//!
+//! Until it exists, two weaker things stand in its place, and naming them is the
+//! point: `tests/query.rs` pins the exact text of every builder case, so a
+//! change to the rendering is visible in a diff instead of silent; and an
+//! acceptance run against a running node is **owed** and is the only thing that
+//! settles whether the text parses. A grammar change on the node side will not
+//! fail anything here.
 //!
 //! Coverage is a staging order, not a shape: `SELECT`, `CREATE`, `UPDATE` and
 //! `DELETE` on one record or one table. Anything else is written by hand and sent
