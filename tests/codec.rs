@@ -22,8 +22,8 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
-use bgv_db_sdk::codec::{decode, encode};
-use bgv_db_sdk::{
+use tessaridb::codec::{decode, encode};
+use tessaridb::{
     EncodingFault, Geometry, Number, Polygon, Position, RecordId, RecordRef, Ring, Value,
     ValueRange,
 };

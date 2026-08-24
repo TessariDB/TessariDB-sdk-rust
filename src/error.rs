@@ -22,7 +22,7 @@ pub enum Error {
     ///
     /// The greeting did not begin with the expected magic, so nothing further is
     /// attempted — the alternative is decoding arbitrary bytes as a frame.
-    #[error("that is not a bgv-db node")]
+    #[error("that is not a TessariDB node")]
     NotThisProtocol,
 
     /// It is a node, of a version this build does not speak.

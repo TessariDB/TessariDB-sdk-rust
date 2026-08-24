@@ -1,11 +1,11 @@
 [package]
-name = "bgv-db-sdk"
+name = "tessaridb"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
-description = "Async client for bgv-db"
-repository = "https://github.com/BoogVAr/bgv-db-sdk-rust"
+description = "Async client for TessariDB"
+repository = "https://github.com/TessariDB/TessariDB-sdk-rust"
 publish = false
 
 [dependencies]

@@ -23,8 +23,8 @@
     clippy::indexing_slicing
 )]
 
-use bgv_db_sdk::Value;
-use bgv_db_sdk::query::{BuildError, Create, Delete, Order, Select, Update, field};
+use tessaridb::Value;
+use tessaridb::query::{BuildError, Create, Delete, Order, Select, Update, field};
 
 #[test]
 fn a_bare_select_projects_everything() {

@@ -3,15 +3,6 @@
 version = 4
 
 [[package]]
-name = "bgv-db-sdk"
-version = "0.1.0"
-dependencies = [
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -131,6 +122,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tessaridb"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

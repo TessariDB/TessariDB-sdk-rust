@@ -10,7 +10,7 @@ use crate::value::Value;
 /// Start a condition on a field.
 ///
 /// ```
-/// use bgv_db_sdk::query::field;
+/// use tessaridb::query::field;
 /// let condition = field("age").gt(21_i64).and(field("active").eq(true));
 /// ```
 #[must_use]

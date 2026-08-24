@@ -1,0 +1,7 @@
+# Words that look like code to `clippy::doc_markdown` but are product names.
+#
+# The lint's heuristic is "mixed case, therefore an identifier", which is right
+# often enough to be worth keeping on — and wrong for every brand written the
+# way brands are written. Naming them here keeps the lint useful instead of
+# scattering backticks through prose where they would read as code.
+doc-valid-idents = ["TessariDB", "TessariQL", "..", "WebSocket", "TypeScript", "JavaScript"]

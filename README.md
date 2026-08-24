@@ -1,17 +1,33 @@
-# bgv-db-sdk-rust
+<div align="center">
 
-The Rust client for **bgv-db**.
+<img src="assets/logo/tessaridb-mark-256.png" alt="" width="88" height="88">
 
-This is the library you use to talk to a bgv-db node: run statements, subscribe
-to changes, store and fetch files, and check whether a node is healthy — without
-writing HTTP by hand.
+# TessariDB — Rust SDK
+
+**The Rust client for [TessariDB](https://github.com/TessariDB/TessariDB).**
+
+[![licence](https://img.shields.io/badge/licence-Apache--2.0-6B5FD1)](LICENSE)
+[![protocol](https://img.shields.io/badge/protocol-v1.0-6B5FD1)](https://github.com/TessariDB/TessariDB-protocol)
+
+</div>
+
+```toml
+[dependencies]
+tessaridb = { git = "https://github.com/TessariDB/TessariDB-sdk-rust" }
+```
+
+This is the library you use to talk to a TessariDB node: run statements,
+subscribe to changes, store and fetch files, and check whether a node is
+healthy — without writing HTTP by hand.
 
 Licence: **Apache-2.0**. See [`LICENSE`](LICENSE). Permissive, with an explicit
 patent grant — the licence a client library you embed in your own product should
 carry.
 
-The server is licensed separately. The boundary runs between the two, and this
-client depends on the server's *protocol*, never on its code.
+The server is licensed separately, under the Business Source License 1.1. The
+boundary runs between the two on purpose: this client depends on the server's
+*protocol*, never on its code, and nothing about the server's licence reaches
+the application you build with this crate.
 
 ---
 
@@ -47,7 +63,7 @@ for as long as you care to listen, which is the workload a thread is the wrong
 unit for — and it is the workload this client exists for.
 
 ```rust
-use bgv_db_sdk::{Client, Follow, Value};
+use tessaridb::{Client, Follow, Value};
 
 let mut client = Client::connect("127.0.0.1:9080").await?;
 
@@ -73,12 +89,12 @@ while let Some(change) = feed.next().await? {
 
 ## What this SDK is for
 
-One client, everything the node serves. If a bgv-db node answers it, this SDK
+One client, everything the node serves. If a TessariDB node answers it, this SDK
 reaches it, and no caller should ever hand-roll an HTTP request to use a surface
 the node already exposes.
 
 ```rust
-let db = bgv_db_sdk::Client::connect("bgv://localhost:9080")?;
+let db = tessaridb::Client::connect("tessari://localhost:9080")?;
 
 let adults = db
     .query("SELECT * FROM users WHERE age > $min;")
@@ -88,7 +104,7 @@ let adults = db
 
 ## It speaks two transports, and that is not a design preference
 
-A bgv-db node serves two surfaces, and **neither one carries everything**:
+A TessariDB node serves two surfaces, and **neither one carries everything**:
 
 | | wire protocol | HTTP |
 |---|---|---|
@@ -136,7 +152,7 @@ not a mystery.
 
 ## What it does not own
 
-**The language.** Statements are bgvQL. This SDK does not invent a second way to
+**The language.** Statements are TessariQL. This SDK does not invent a second way to
 express them. The query builder is not a dialect: it produces the same grammar
 the server parses, and that is checked by round-tripping built queries through
 the server's own parser rather than by reading them.
@@ -171,7 +187,7 @@ An incomplete query does not compile: a `Select` with no source has no `build`.
 - **`main`** — stable.
 - **`dev`** — integration; work lands here first.
 
-Matching the layout of the `bgv-db` repository.
+Matching the layout of the `TessariDB` repository.
 
 ## Building the surface
 

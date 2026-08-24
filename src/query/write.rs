@@ -8,8 +8,8 @@ use crate::value::Value;
 /// Write a record, replacing whatever was there.
 ///
 /// ```
-/// use bgv_db_sdk::query::Create;
-/// use bgv_db_sdk::Value;
+/// use tessaridb::query::Create;
+/// use tessaridb::Value;
 ///
 /// let query = Create::record("memories", "note-1")
 ///     .set("body", "the user prefers metric units")

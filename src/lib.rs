@@ -1,4 +1,4 @@
-//! An async client for bgv-db.
+//! An async client for TessariDB.
 //!
 //! # What this crate is written against
 //!
@@ -37,8 +37,8 @@
 //! example that lives only in prose is one that drifts.
 //!
 //! ```no_run
-//! # async fn run() -> Result<(), bgv_db_sdk::Error> {
-//! use bgv_db_sdk::{Client, Follow, Value};
+//! # async fn run() -> Result<(), tessaridb::Error> {
+//! use tessaridb::{Client, Follow, Value};
 //!
 //! let mut client = Client::connect("127.0.0.1:9080").await?;
 //!
@@ -97,7 +97,7 @@ pub use crate::wire::push::{Became, Change, Follow};
 /// constant rather than a string typed in several files.
 pub mod protocol {
     /// What every connection says first, in both directions.
-    pub const GREETING: &[u8; 4] = b"BGVW";
+    pub const GREETING: &[u8; 4] = b"TESS";
 
     /// The protocol major this client speaks.
     ///

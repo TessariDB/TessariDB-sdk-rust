@@ -24,7 +24,7 @@ impl Order {
 /// A read.
 ///
 /// ```
-/// use bgv_db_sdk::query::{Order, Select, field};
+/// use tessaridb::query::{Order, Select, field};
 ///
 /// let query = Select::from("memories")
 ///     .filter(field("session").eq("abc"))

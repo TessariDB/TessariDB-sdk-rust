@@ -29,11 +29,11 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::path::PathBuf;
 
-use bgv_db_sdk::codec::{decode, encode};
-use bgv_db_sdk::{
+use serde_json::Value as Json;
+use tessaridb::codec::{decode, encode};
+use tessaridb::{
     Geometry, Number, Polygon, Position, RecordId, RecordRef, Ring, Value, ValueRange,
 };
-use serde_json::Value as Json;
 
 /// Where the corpus lives.
 ///
@@ -43,10 +43,10 @@ use serde_json::Value as Json;
 /// to check is worse than no suite at all, because it reports coverage it does
 /// not have.
 fn corpus_path() -> PathBuf {
-    std::env::var("BGV_PROTOCOL_CORPUS").map_or_else(
+    std::env::var("TESSARI_PROTOCOL_CORPUS").map_or_else(
         |_| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../bgv-db-protocol/conformance/values-v1.json")
+                .join("../tessaridb-protocol/conformance/values-v1.json")
         },
         PathBuf::from,
     )
@@ -272,7 +272,7 @@ fn every_corpus_vector_encodes_and_decodes_exactly() {
             "the conformance corpus is required, not optional — a suite that \
              passes having found nothing reports coverage it does not have.\n\
              tried: {}\n{why}\n\
-             set BGV_PROTOCOL_CORPUS to point at values-v1.json",
+             set TESSARI_PROTOCOL_CORPUS to point at values-v1.json",
             path.display()
         )
     });
@@ -280,7 +280,7 @@ fn every_corpus_vector_encodes_and_decodes_exactly() {
 
     assert_eq!(
         document["protocol_major"].as_u64(),
-        Some(u64::from(bgv_db_sdk::protocol::MAJOR)),
+        Some(u64::from(tessaridb::protocol::MAJOR)),
         "this client implements a different major from the corpus"
     );
 
