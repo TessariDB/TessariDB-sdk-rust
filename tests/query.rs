@@ -23,8 +23,8 @@
     clippy::indexing_slicing
 )]
 
-use tessaridb::Value;
-use tessaridb::query::{BuildError, Create, Delete, Order, Select, Update, field};
+use tessaridb_client::Value;
+use tessaridb_client::query::{BuildError, Create, Delete, Order, Select, Update, field};
 
 #[test]
 fn a_bare_select_projects_everything() {

@@ -22,8 +22,8 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
-use tessaridb::codec::{decode, encode};
-use tessaridb::{
+use tessaridb_client::codec::{decode, encode};
+use tessaridb_client::{
     EncodingFault, Geometry, Number, Polygon, Position, RecordId, RecordRef, Ring, Value,
     ValueRange,
 };

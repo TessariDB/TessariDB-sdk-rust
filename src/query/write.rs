@@ -8,8 +8,8 @@ use crate::value::Value;
 /// Write a record, replacing whatever was there.
 ///
 /// ```
-/// use tessaridb::query::Create;
-/// use tessaridb::Value;
+/// use tessaridb_client::query::Create;
+/// use tessaridb_client::Value;
 ///
 /// let query = Create::record("memories", "note-1")
 ///     .set("body", "the user prefers metric units")

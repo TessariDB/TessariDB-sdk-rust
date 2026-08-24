@@ -37,8 +37,8 @@
 //! example that lives only in prose is one that drifts.
 //!
 //! ```no_run
-//! # async fn run() -> Result<(), tessaridb::Error> {
-//! use tessaridb::{Client, Follow, Value};
+//! # async fn run() -> Result<(), tessaridb_client::Error> {
+//! use tessaridb_client::{Client, Follow, Value};
 //!
 //! let mut client = Client::connect("127.0.0.1:9080").await?;
 //!

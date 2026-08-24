@@ -13,10 +13,10 @@
     clippy::expect_used,
     clippy::indexing_slicing
 )]
-use tessaridb::protocol::{CEILING, GREETING, MAJOR, MINOR};
-use tessaridb::wire::frame::{self, Kind};
-use tessaridb::wire::message::decode_answers;
-use tessaridb::{Answer, Client, Error, Number, Request, Value};
+use tessaridb_client::protocol::{CEILING, GREETING, MAJOR, MINOR};
+use tessaridb_client::wire::frame::{self, Kind};
+use tessaridb_client::wire::message::decode_answers;
+use tessaridb_client::{Answer, Client, Error, Number, Request, Value};
 use tokio::io::AsyncWriteExt;
 
 /// One outcome, behind the `u32` length the protocol puts in front of it.
@@ -308,7 +308,7 @@ fn a_value_outcome_carries_the_names_its_references_need() {
     tagged.extend_from_slice(&5_u32.to_be_bytes());
     tagged.extend_from_slice(b"users");
     // the value: integer 1
-    let value = tessaridb::codec::encode(&Value::Number(Number::Integer(1)));
+    let value = tessaridb_client::codec::encode(&Value::Number(Number::Integer(1)));
     let value_len = u32::try_from(value.len()).expect("the test value is small");
     tagged.extend_from_slice(&value_len.to_be_bytes());
     tagged.extend_from_slice(&value);

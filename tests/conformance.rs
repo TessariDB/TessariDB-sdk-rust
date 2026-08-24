@@ -30,8 +30,8 @@ use std::ops::Bound;
 use std::path::PathBuf;
 
 use serde_json::Value as Json;
-use tessaridb::codec::{decode, encode};
-use tessaridb::{
+use tessaridb_client::codec::{decode, encode};
+use tessaridb_client::{
     Geometry, Number, Polygon, Position, RecordId, RecordRef, Ring, Value, ValueRange,
 };
 
@@ -280,7 +280,7 @@ fn every_corpus_vector_encodes_and_decodes_exactly() {
 
     assert_eq!(
         document["protocol_major"].as_u64(),
-        Some(u64::from(tessaridb::protocol::MAJOR)),
+        Some(u64::from(tessaridb_client::protocol::MAJOR)),
         "this client implements a different major from the corpus"
     );
 

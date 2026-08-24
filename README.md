@@ -19,8 +19,13 @@
 
 ```toml
 [dependencies]
-tessaridb = { git = "https://github.com/TessariDB/TessariDB-sdk-rust" }
+tessaridb-client = { git = "https://github.com/TessariDB/TessariDB-sdk-rust" }
 ```
+
+The crate is `tessaridb-client`, not `tessaridb`: the plain name belongs to the
+**engine**, which is the thing you embed, and this is the thing you call a node
+with. The two also carry different licences, so a name that could fetch either
+would be a name that decides your licence by accident.
 
 This is the library you use to talk to a TessariDB node: run statements,
 subscribe to changes, store and fetch files, and check whether a node is
@@ -74,8 +79,11 @@ for as long as you care to listen, which is the workload a thread is the wrong
 unit for — and it is the workload this client exists for.
 
 ```rust
-use tessaridb::{Client, Follow, Value};
+use tessaridb_client::{Client, Follow, Value};
 
+// An address is a host and a port, not a URL: the connection is a TCP socket
+// carrying the wire protocol, and a scheme would imply a negotiation that does
+// not happen.
 let mut client = Client::connect("127.0.0.1:9080").await?;
 
 let answers = client
@@ -103,15 +111,6 @@ while let Some(change) = feed.next().await? {
 One client, everything the node serves. If a TessariDB node answers it, this SDK
 reaches it, and no caller should ever hand-roll an HTTP request to use a surface
 the node already exposes.
-
-```rust
-let db = tessaridb::Client::connect("tessari://localhost:9080")?;
-
-let adults = db
-    .query("SELECT * FROM users WHERE age > $min;")
-    .bind("min", 21)
-    .fetch::<User>()?;
-```
 
 ## It speaks two transports, and that is not a design preference
 
