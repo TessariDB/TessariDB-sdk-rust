@@ -6,10 +6,16 @@
 
 **The Rust client for [TessariDB](https://github.com/TessariDB/TessariDB).**
 
-[![licence](https://img.shields.io/badge/licence-Apache--2.0-6B5FD1)](LICENSE)
-[![protocol](https://img.shields.io/badge/protocol-v1.0-6B5FD1)](https://github.com/TessariDB/TessariDB-protocol)
+[![status](https://img.shields.io/badge/status-in%20development-D98E33?style=flat-square)](#status)
+[![licence](https://img.shields.io/badge/licence-Apache--2.0-6B5FD1?style=flat-square)](LICENSE)
+[![protocol](https://img.shields.io/badge/protocol-v1.0-6B5FD1?style=flat-square)](https://github.com/TessariDB/TessariDB-protocol)
 
 </div>
+
+> [!WARNING]
+> **Under active development, and not ready for production.** Unpublished to
+> crates.io; the HTTP half of the client is not written yet, and the API changes
+> without notice. See [**Status**](#status).
 
 ```toml
 [dependencies]
@@ -33,9 +39,14 @@ the application you build with this crate.
 
 ## Status
 
-**Early.** The wire half works: connect, run statements with bound parameters,
-decode every value type, subscribe to changes, and build the four common
-statements. The HTTP half — objects, files, backup, health — is next.
+**Stage: active development · early · not published to crates.io.**
+
+- ✅ **Runs:** the wire half — connect, run statements with bound parameters,
+  decode every value type, subscribe to changes, and build the four common
+  statements.
+- 🚧 **Next:** the HTTP half — objects, files, backup, health.
+- ⚠️ **Unstable:** the public API changes without notice while the server it
+  talks to is pre-1.0.
 
 It implements **protocol 1.0**: a two-number version where only a differing
 major is a refusal, and an outcome kind this build has never seen is stepped over
