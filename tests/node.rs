@@ -48,7 +48,9 @@
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use tessaridb_client::{Answer, Client, FromRecord, MappingFault, Number, Row, Value};
+use tessaridb_client::{
+    Answer, Became, Change, Client, Feed, Follow, FromRecord, MappingFault, Number, Row, Value,
+};
 
 /// How long a node gets to bind its port before the test gives up.
 ///
@@ -390,4 +392,137 @@ async fn a_field_the_node_did_not_write_comes_back_as_no_key_at_all() {
         Some(&Value::String("grace".to_owned())),
         "the record did arrive and does carry the field that was written"
     );
+}
+
+/// The session context a second connection needs.
+///
+/// The namespace, database and table are already defined by whoever ran
+/// [`PREAMBLE`]; what a new connection lacks is not the schema but the `USE`
+/// statements, because one connection is one session.
+const USE_CONTEXT: &str = "USE NAMESPACE app; USE DATABASE main;";
+
+/// How long a change gets to arrive before the test says it did not.
+///
+/// Bounded on purpose: `Feed::next` waits for the node to push, so an
+/// unbounded wait would hang the whole suite rather than fail it, and a hung
+/// suite reports nothing at all.
+const CHANGE_BUDGET: Duration = Duration::from_secs(10);
+
+/// The next change, or a failure naming the budget it outlived.
+///
+/// The stream type is spelled out because `Feed<S>` carries no default, unlike
+/// `Client<S = TcpStream>` beside it. Noted as Q-SDK-12 rather than fixed here:
+/// the asymmetry is real and the fix is one word, but it is production API and
+/// this wave's request was evidence for S6 (BGV-SURGICAL-001).
+async fn next_change(feed: &mut Feed<tokio::net::TcpStream>) -> Change {
+    match tokio::time::timeout(CHANGE_BUDGET, feed.next()).await {
+        Ok(Ok(Some(change))) => change,
+        Ok(Ok(None)) => panic!("the feed ended before the change arrived"),
+        Ok(Err(error)) => panic!("the feed failed: {error}"),
+        Err(elapsed) => panic!("no change arrived within {CHANGE_BUDGET:?} ({elapsed})"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn a_change_written_on_another_connection_arrives_on_the_subscription() {
+    // The two connections are the criterion, not an implementation detail. A
+    // test that subscribes and asserts the subscription was *accepted* passes
+    // with no push ever occurring, and one that writes and reads on a single
+    // connection may be reading its own echo. Only a change crossing between
+    // two sockets shows that the node pushed anything.
+    let node = Node::start().await;
+
+    let mut writer = node.client().await;
+    writer
+        .run(PREAMBLE, None)
+        .await
+        .expect("the preamble should be accepted");
+
+    // `follow` takes the client by value: a socket delivering changes is not
+    // also answering scripts. So the watcher is a second connection, and needs
+    // its own session context before it subscribes.
+    let mut watcher = node.client().await;
+    watcher
+        .run(USE_CONTEXT, None)
+        .await
+        .expect("the watcher's session context should be accepted");
+    let mut feed = watcher
+        .follow(&Follow::everything().to_table("users"))
+        .await
+        .expect("the subscription should be accepted");
+
+    writer
+        .run("CREATE users:1 = { name: 'ada' };", None)
+        .await
+        .expect("the write should be accepted");
+
+    let change = next_change(&mut feed).await;
+
+    assert_eq!(change.table, "users");
+    assert_eq!(change.id, "1");
+    let Became::Written(value) = &change.became else {
+        panic!("a CREATE writes; got {:?}", change.became);
+    };
+    assert_eq!(
+        field(value, "name"),
+        &Value::String("ada".to_owned()),
+        "the pushed value is the one that was written, not merely a notification \
+         that something happened"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn the_table_filter_excludes_a_table_it_was_not_given() {
+    // Proven by ORDERING rather than by a timeout. The obvious test writes to
+    // the excluded table and waits for nothing to arrive — which passes when the
+    // filter works and equally when the node is merely slow, and costs its whole
+    // budget every run.
+    //
+    // Here the excluded write goes FIRST and the watched write SECOND. If the
+    // filter leaks, the excluded change is already in the feed ahead of the one
+    // being waited for, and the assertion fails on it. The positive control is
+    // built in: the `users` change must arrive, or the budget fails the test.
+    let node = Node::start().await;
+
+    let mut writer = node.client().await;
+    writer
+        .run(&format!("{PREAMBLE} DEFINE TABLE logs;"), None)
+        .await
+        .expect("the preamble and the second table should be accepted");
+
+    let mut watcher = node.client().await;
+    watcher
+        .run(USE_CONTEXT, None)
+        .await
+        .expect("the watcher's session context should be accepted");
+    let mut feed = watcher
+        .follow(&Follow::everything().to_table("users"))
+        .await
+        .expect("the subscription should be accepted");
+
+    writer
+        .run("CREATE logs:1 = { line: 'ignored' };", None)
+        .await
+        .expect("the excluded write should be accepted");
+    writer
+        .run("CREATE users:1 = { name: 'ada' };", None)
+        .await
+        .expect("the watched write should be accepted");
+
+    // Read until the watched change appears. `Follow::everything` starts at
+    // position 0, so the log is replayed from the beginning and unrelated
+    // entries may precede it; what must never appear is the excluded table.
+    loop {
+        let change = next_change(&mut feed).await;
+        assert_ne!(
+            change.table, "logs",
+            "a subscription narrowed to `users` delivered a change for `logs`; \
+             the filter is not filtering"
+        );
+        if change.table == "users" && change.id == "1" {
+            break;
+        }
+    }
 }
