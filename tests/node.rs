@@ -1,0 +1,259 @@
+//! The client against a node that is actually running.
+//!
+//! Every other test in this crate drives a mock: a duplex, or a `tokio::spawn`
+//! that writes the bytes this client expects. Those tests are worth having — they
+//! pin the framing exactly — but they share one blind spot, and it is the
+//! important one. A mock is written from the same understanding of the protocol
+//! as the client, by the same author, at the same time. When that understanding
+//! is wrong, the mock is wrong in precisely the same direction, and the pair
+//! agree with each other all the way to production.
+//!
+//! So this file exists to be the one tier that can disagree. The node here is the
+//! shipped binary, started as a child process, speaking whatever it actually
+//! speaks.
+//!
+//! # Why these are `#[ignore]`
+//!
+//! `cargo test` must stay hermetic: no binary, no network peer, no environment.
+//! These run when asked for, which is also when the binary is known to exist:
+//!
+//! ```text
+//! TESSARIDB_BIN=/path/to/tessaridb cargo test --test node -- --ignored
+//! ```
+//!
+//! # Why the binary comes from the environment
+//!
+//! This crate depends on the database's repository by no mechanism — no path
+//! dependency, no git revision, no vendored source. Naming a binary at run time
+//! is a dependency of *this test*, not of the crate, and nothing about it reaches
+//! `Cargo.toml`. A client for this protocol has to be writable in a language that
+//! cannot link the server at all, and that stays true here.
+//!
+//! # Why a missing binary fails instead of skipping
+//!
+//! A test that quietly skips when its environment is absent reports success for a
+//! node nobody connected to. That is the same shape as a search that returns zero
+//! because it was pointed at nothing, and this project has already been caught by
+//! it twice. Asking for these tests and getting a pass must mean a node answered.
+
+// Assertions are exactly where a panic is the correct outcome; these lints target
+// production paths, where a panic is a defect.
+#![allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)]
+
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+use tessaridb_client::{Answer, Client, Number, Value};
+
+/// How long a node gets to bind its port before the test gives up.
+///
+/// Bounded rather than open-ended: a wait with no deadline turns "the node did
+/// not start" into a suite that hangs, which is the failure that costs the most
+/// to diagnose.
+const STARTUP_BUDGET: Duration = Duration::from_secs(10);
+
+/// A node started for one test, and stopped when that test ends.
+struct Node {
+    child: Child,
+    address: String,
+}
+
+impl Node {
+    /// Start the shipped binary on a free port and wait until it answers.
+    async fn start() -> Self {
+        let binary = std::env::var("TESSARIDB_BIN").unwrap_or_else(|_| {
+            panic!(
+                "TESSARIDB_BIN is not set.\n\
+                 These tests exercise a real node and have nothing to fall back \
+                 on. A version of this that skipped here would report success \
+                 for a client that never connected to anything, which is worse \
+                 than a failure because it looks like evidence.\n\
+                 Set it to the shipped binary and run with `--ignored`."
+            )
+        });
+
+        // Port 0 asks the OS for one that is free, which is what lets these run
+        // beside the database's own suites — those bind fixed ports, and a fixed
+        // port chosen here would collide with them exactly when both are running.
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap_or_else(|e| panic!("could not find a free port: {e}"));
+            probe.local_addr().unwrap().port()
+        };
+        let address = format!("127.0.0.1:{port}");
+
+        // The store is in memory: no path argument, so it exists for this child
+        // and is gone when it dies. Nothing on disk to clean up, and no way for
+        // one test to see another's writes.
+        let child = Command::new(&binary)
+            .arg("--serve")
+            .arg(&address)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("could not start {binary}: {e}"));
+
+        let node = Self { child, address };
+        node.wait_until_listening().await;
+        node
+    }
+
+    /// Poll until the port answers, or fail naming how long was spent.
+    async fn wait_until_listening(&self) {
+        // Measured as elapsed rather than as a deadline instant: adding a
+        // duration to an instant can overflow, and this crate denies bare
+        // arithmetic for exactly that class of thing. Elapsed time only compares.
+        let started = std::time::Instant::now();
+        loop {
+            if tokio::net::TcpStream::connect(&self.address).await.is_ok() {
+                return;
+            }
+            assert!(
+                started.elapsed() < STARTUP_BUDGET,
+                "the node did not accept a connection on {} within {:?}",
+                self.address,
+                STARTUP_BUDGET
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A client already connected to this node.
+    async fn client(&self) -> Client {
+        Client::connect(&self.address)
+            .await
+            .unwrap_or_else(|e| panic!("could not connect to the node at {}: {e}", self.address))
+    }
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        // By handle, never by name: the database's own suites run this same
+        // binary, and killing by pattern would take theirs down too.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A namespace, a database and a table, so a record has somewhere to live.
+///
+/// One connection is one session, so the `USE` statements below are still in
+/// force for every later statement on the same client — which is what makes this
+/// a setup step rather than a prefix every test has to repeat.
+const PREAMBLE: &str = "DEFINE NAMESPACE app; USE NAMESPACE app; \
+                        DEFINE DATABASE main; USE DATABASE main; \
+                        DEFINE TABLE users;";
+
+/// Pull the records out of an answer, or say what arrived instead.
+fn records(answer: &Answer) -> &Vec<(String, Value)> {
+    match answer {
+        Answer::Records { records, .. } => records,
+        other => panic!("expected records, and the node answered {other:?}"),
+    }
+}
+
+/// Read one field of a record's value.
+fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
+    match value {
+        Value::Object(fields) => fields
+            .get(name)
+            .unwrap_or_else(|| panic!("no field {name} in {value:?}")),
+        other => panic!("a record should be an object, and this is {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn a_node_that_is_really_running_completes_the_greeting() {
+    let node = Node::start().await;
+
+    // Connecting is the assertion. The greeting is where a wrong protocol or a
+    // wrong version is refused, so reaching this line at all means the magic, the
+    // major and the minor were what this client believes them to be — against the
+    // node itself rather than against a fixture repeating the belief back.
+    let _client = node.client().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn a_script_runs_against_a_real_node_and_its_records_come_back() {
+    let node = Node::start().await;
+    let mut client = node.client().await;
+
+    let answers = client
+        .run(
+            &format!("{PREAMBLE} CREATE users:1 = {{ name: 'ada', age: 36 }};"),
+            None,
+        )
+        .await
+        .expect("the preamble and the write should be accepted");
+    assert_eq!(
+        answers.len(),
+        6,
+        "one answer per statement, in order; got {answers:?}"
+    );
+
+    let answers = client
+        .run("SELECT * FROM users;", None)
+        .await
+        .expect("the read should be accepted");
+    let found = records(&answers[0]);
+    assert_eq!(found.len(), 1, "one record was written; got {found:?}");
+
+    let (id, value) = &found[0];
+    assert_eq!(
+        id, "1",
+        "the identity comes back as the node spells it — bare, not qualified by \
+         its table, because the answer already says which table it read"
+    );
+    assert_eq!(field(value, "name"), &Value::String("ada".to_owned()));
+    assert_eq!(field(value, "age"), &Value::Number(Number::Integer(36)));
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn a_bound_value_reaches_a_real_node_as_data_and_never_as_script() {
+    let node = Node::start().await;
+    let mut client = node.client().await;
+
+    client
+        .run(PREAMBLE, None)
+        .await
+        .expect("the preamble should be accepted");
+
+    // Punctuation that would end the statement and begin a destructive one, if
+    // this ever became syntax. The mock tests already assert it stays in the
+    // parameter map; what they cannot show is what the *node* does with it, and
+    // that is the half that matters.
+    let hostile = "'; DROP TABLE users; --";
+    client
+        .run_with(
+            "CREATE users:2 = { name: $name };",
+            None,
+            [("name", Value::from(hostile))],
+        )
+        .await
+        .expect("a bound value is data, so this is an ordinary write");
+
+    let answers = client
+        .run("SELECT * FROM users;", None)
+        .await
+        .expect("the table should still be there — which is the point");
+    let found = records(&answers[0]);
+
+    assert_eq!(
+        found.len(),
+        1,
+        "the write landed and the table survives; got {found:?}"
+    );
+    assert_eq!(
+        field(&found[0].1, "name"),
+        &Value::String(hostile.to_owned()),
+        "the value came back exactly as sent, having never been read as grammar"
+    );
+}
