@@ -41,11 +41,17 @@
 //!
 //! # There is no derive macro, and that is a decision
 //!
-//! The whole dependency tree of this crate is `tokio` and `thiserror`. A
-//! procedural-macro crate — with the compile-time cost it brings to everyone who
-//! builds a client — is not a trade worth making to save a caller the ten lines
-//! above. The `impl` is written by hand, and the compiler checks it against the
-//! struct rather than against a string in an attribute.
+//! A derive would be a macro crate of this project's own to write, version and
+//! keep working, bought to save a caller the ten lines above. The `impl` is
+//! written by hand instead, and the compiler checks it against the struct rather
+//! than against a string in an attribute — a misspelled field name is a
+//! compile error at the line that misspelled it.
+//!
+//! `serde_json` is a dependency, for reading the node's HTTP answers, whose
+//! strings carry arbitrary user text. It is used as a value tree: no
+//! `Deserialize` implementations, no `serde_derive`, and so no `#[derive]` on
+//! anything here. Having a JSON reader does not bring a derive, and it is the
+//! derive this is a decision about.
 //!
 //! # There is no blanket implementation either
 //!

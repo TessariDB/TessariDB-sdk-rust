@@ -49,8 +49,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use tessaridb_client::{
-    Answer, Became, Change, Client, Error, Feed, Follow, FromRecord, MappingFault, Number,
-    Operations, Row, Value,
+    Answer, Became, Change, Client, Condition, Error, Feed, Follow, FromRecord, MappingFault,
+    Number, Operations, Row, Value,
 };
 
 /// How long a node gets to bind its port before the test gives up.
@@ -581,6 +581,24 @@ impl HttpNode {
     fn operations(&self) -> Operations {
         Operations::at(&self.address)
     }
+
+    /// Ask the node to stop, and return while it is still serving.
+    ///
+    /// The node answers a `SIGTERM` with a staged shutdown whose first stage
+    /// says *not ready* and keeps serving for a few seconds, so a load balancer
+    /// learns it before the port goes. That window is the only way to observe
+    /// the leaving state, and it is what `ready` exists to report.
+    ///
+    /// Sent through `kill` rather than through a signalling crate: this is the
+    /// one place a test needs a signal, and it is not worth a dependency.
+    fn ask_to_stop(&self) {
+        let sent = Command::new("kill")
+            .arg("-TERM")
+            .arg(self.child.id().to_string())
+            .status()
+            .unwrap_or_else(|e| panic!("could not send SIGTERM: {e}"));
+        assert!(sent.success(), "kill -TERM did not succeed: {sent}");
+    }
 }
 
 impl Drop for HttpNode {
@@ -638,5 +656,88 @@ async fn a_peer_that_is_not_speaking_http_is_refused_rather_than_mis_read() {
     assert!(
         matches!(refused, Error::NotThisProtocol | Error::Truncated),
         "the refusal should name what went wrong; got {refused:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn a_well_node_reports_ok_and_how_far_it_has_committed() {
+    let node = HttpNode::start().await;
+
+    let condition = node
+        .operations()
+        .health()
+        .await
+        .expect("a node that just started should report its condition");
+
+    // Matched rather than compared, because the commit position of a fresh
+    // in-memory store is not this test's claim — that it arrives at all is.
+    assert!(
+        matches!(condition, Condition::Ok { .. }),
+        "a node that just started should be well; got {condition:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn readiness_and_health_diverge_when_the_node_is_leaving() {
+    // The two routes agree on every healthy node, which is exactly what makes
+    // collapsing them into one method tempting. They are worth separating only
+    // where they stop agreeing, so that is what this asserts.
+    //
+    // A supervisor acts on the difference: not-ready means *stop sending
+    // traffic*, not-healthy means *restart it*. A client that reported one for
+    // the other would take a node out of service that needed restarting, or
+    // restart one that was deliberately draining.
+    let node = HttpNode::start().await;
+
+    // Well first, so the divergence below is a change rather than a starting
+    // condition — without this the test would pass against a client that
+    // hard-coded `Leaving`.
+    assert!(
+        matches!(
+            node.operations()
+                .ready()
+                .await
+                .expect("ready before stopping"),
+            Condition::Ok { .. }
+        ),
+        "a node that has not been asked to stop should be ready"
+    );
+
+    node.ask_to_stop();
+
+    // The node keeps serving through the lame-duck window; this races that
+    // window rather than waiting for it, so it asks immediately and treats a
+    // still-ready answer as the retry rather than as the verdict.
+    let mut leaving = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while std::time::Instant::now() < deadline {
+        match node.operations().ready().await {
+            Ok(Condition::Leaving) => {
+                leaving = Some(Condition::Leaving);
+                break;
+            }
+            Ok(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            Err(e) => panic!("the node stopped serving before it said it was leaving: {e}"),
+        }
+    }
+    assert_eq!(
+        leaving,
+        Some(Condition::Leaving),
+        "a node in staged shutdown should report itself leaving"
+    );
+
+    // The same node, at the same moment, on the other route. This is the half
+    // that makes the test about divergence rather than about shutdown: if
+    // `health` were `ready` under another name, this would read `Leaving` too.
+    let health = node
+        .operations()
+        .health()
+        .await
+        .expect("a leaving node is still serving, so health must still answer");
+    assert!(
+        matches!(health, Condition::Ok { .. }),
+        "a node that is leaving is not thereby unwell; got {health:?}"
     );
 }

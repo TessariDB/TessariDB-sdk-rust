@@ -66,7 +66,8 @@ one place, rather than emerging from whichever module someone writes first.
 
 This client implements the published protocol specification and takes **no
 dependency on the database's repository** — not by path, not by git, not by a
-published crate. Its whole dependency tree is `tokio` and `thiserror`.
+published crate. It depends on `tokio`, `thiserror` and `serde_json`, and on
+nothing else directly.
 
 That is what lets the same protocol have a client in any language, and it is why
 a rename inside the server cannot break a client that never used the renamed
