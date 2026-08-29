@@ -81,7 +81,7 @@ pub use crate::error::{EncodingFault, Error, Result};
 pub use crate::feed::Feed;
 pub use crate::geometry::{Geometry, Polygon, Position, Ring};
 pub use crate::value::{Number, RecordId, RecordRef, Value, ValueRange};
-pub use crate::wire::message::{Answer, Names, Parameters, Request};
+pub use crate::wire::message::{Answer, Names, Note, Parameters, Request};
 pub use crate::wire::push::{Became, Change, Follow};
 
 /// The protocol constants.

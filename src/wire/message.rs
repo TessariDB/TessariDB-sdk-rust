@@ -124,6 +124,24 @@ mod tag {
     pub(super) const REMOVED: u8 = 4;
 }
 
+/// Something a read volunteered about how it answered.
+///
+/// A **kind and a message**, not a structure. A client's two uses are to group
+/// by the first and show the second, and a typed note would put the node's whole
+/// vocabulary into this build for no gain.
+///
+/// The kinds a node sends today are `fell-back`, `approximate`,
+/// `compared-across-kinds`, `cursor-walked` and `subquery-ceiling`. That list is
+/// **not** closed and is not matched on here: an unfamiliar kind is a newer node
+/// saying something this build has no name for, which is not an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Note {
+    /// Which kind of thing the read is saying.
+    pub kind: String,
+    /// What it says, in words meant for a person.
+    pub message: String,
+}
+
 /// What a client got back for one statement.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -131,6 +149,13 @@ pub enum Answer {
     /// The statement did its work.
     Done,
     /// Records, each with its identity as written and its value.
+    ///
+    /// Marked `#[non_exhaustive]` as well as the enum. The enum's attribute
+    /// covers a new *variant*; this one covers a new *field*, and this variant
+    /// has now gained one twice — the notes and the `ONLY` flag below — because
+    /// the frame grows by appending. Without it every such addition is a
+    /// breaking change for anyone matching the fields out.
+    #[non_exhaustive]
     Records {
         /// What was found — identity as the node spells it, and the value.
         records: Vec<(String, Value)>,
@@ -142,6 +167,20 @@ pub enum Answer {
         path: String,
         /// What the tables these records reference are called.
         names: Names,
+        /// What the read volunteered about how it answered.
+        ///
+        /// Empty when the node had nothing to say, and also when the node
+        /// predates notes entirely — the two are the same claim, so they are not
+        /// distinguished.
+        notes: Vec<Note>,
+        /// Whether the statement wrote `ONLY`.
+        ///
+        /// An assertion by the statement's author that at most one record
+        /// answers. A caller that offers the clause should render such an answer
+        /// as the record itself rather than as a list holding it; ignoring the
+        /// flag is conforming, and produces a one-element array with nothing to
+        /// say it was asked for differently.
+        only: bool,
     },
     /// One value, and the names of the tables it references.
     Value {
@@ -211,10 +250,30 @@ fn decode_one(reader: &mut Body<'_>) -> Result<Answer> {
                 let bytes = reader.take_bytes()?;
                 records.push((id, decode(&bytes).map_err(Error::from)?));
             }
+            // Everything past the records is a later addition, and the frame
+            // grows by appending — so each field is read only if it is there,
+            // and absent means the node had nothing to add rather than that the
+            // body was truncated. The outcome's own length is what makes that
+            // distinction safe to draw.
+            let notes = if reader.remaining() > 0 {
+                let count = reader.take_u32()?;
+                let mut notes = Vec::new();
+                for _ in 0..count {
+                    let kind = reader.take_text()?;
+                    let message = reader.take_text()?;
+                    notes.push(Note { kind, message });
+                }
+                notes
+            } else {
+                Vec::new()
+            };
+            let only = reader.remaining() > 0 && reader.take_u8()? != 0;
             Ok(Answer::Records {
                 records,
                 path,
                 names,
+                notes,
+                only,
             })
         }
         tag::VALUE => {

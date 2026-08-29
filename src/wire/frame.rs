@@ -241,4 +241,14 @@ impl<'a> Body<'a> {
     pub(crate) fn take_text(&mut self) -> Result<String> {
         String::from_utf8(self.take_bytes()?).map_err(|_| Error::Malformed)
     }
+
+    /// How many bytes of this body have not been read.
+    ///
+    /// Asked where a field is a later addition to a frame: the frame grows by
+    /// appending, so absent means the node had nothing to add rather than that
+    /// the body was cut short. That distinction is only safe to draw because
+    /// each outcome is decoded inside a cursor bounded by its own length.
+    pub(crate) const fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.at)
+    }
 }

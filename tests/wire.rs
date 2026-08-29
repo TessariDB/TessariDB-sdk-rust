@@ -322,3 +322,80 @@ fn a_value_outcome_carries_the_names_its_references_need() {
         other => panic!("expected a Value outcome, got {other:?}"),
     }
 }
+
+/// A `text` field as the protocol writes it: a `u32` length then the bytes.
+fn text(word: &str) -> Vec<u8> {
+    let mut out = u32::try_from(word.len())
+        .expect("a test string is small")
+        .to_be_bytes()
+        .to_vec();
+    out.extend_from_slice(word.as_bytes());
+    out
+}
+
+/// A Records outcome carrying no records and no table names, with `tail`
+/// appended where the later fields go.
+///
+/// Empty on purpose: the fields this exercises sit *after* the records, so a
+/// record in the way would only add a value payload to hand-build.
+fn records_outcome(tail: &[u8]) -> Vec<u8> {
+    let mut body = vec![1_u8, 2_u8]; // tag Records, access path `scan`
+    body.extend_from_slice(&0_u32.to_be_bytes()); // no table names
+    body.extend_from_slice(&0_u32.to_be_bytes()); // no records
+    body.extend_from_slice(tail);
+    outcome(&body)
+}
+
+#[test]
+fn a_records_outcome_carries_what_the_read_volunteered() {
+    let mut tail = 2_u32.to_be_bytes().to_vec();
+    tail.extend_from_slice(&text("fell-back"));
+    tail.extend_from_slice(&text("an index could have served this"));
+    tail.extend_from_slice(&text("cursor-walked"));
+    tail.extend_from_slice(&text("the anchor was reached by walking"));
+    tail.push(1); // ONLY was written
+
+    let answers = decode_answers(&answer_body(&[records_outcome(&tail)])).expect("this decodes");
+    let [Answer::Records { notes, only, .. }] = answers.as_slice() else {
+        panic!("expected one Records outcome, got {answers:?}");
+    };
+    assert!(*only);
+    assert_eq!(
+        notes
+            .iter()
+            .map(|note| note.kind.as_str())
+            .collect::<Vec<_>>(),
+        ["fell-back", "cursor-walked"],
+    );
+    assert_eq!(notes[0].message, "an index could have served this");
+}
+
+#[test]
+fn a_records_outcome_from_a_node_that_predates_these_fields_reads_as_silence() {
+    // The frame grows by appending, so an older node's body simply ends after
+    // the records. Read as a truncation this would be an error; read correctly
+    // it is a node with nothing to add, which is what every read was before
+    // these fields existed.
+    let answers = decode_answers(&answer_body(&[records_outcome(&[])])).expect("this decodes");
+    let [Answer::Records { notes, only, .. }] = answers.as_slice() else {
+        panic!("expected one Records outcome, got {answers:?}");
+    };
+    assert!(notes.is_empty());
+    assert!(!*only);
+}
+
+#[test]
+fn notes_without_the_flag_behind_them_still_read_and_the_flag_is_false() {
+    // The half-step between the two nodes above: notes shipped one release
+    // before the flag did, so this is a real body and not a hypothetical one.
+    let mut tail = 1_u32.to_be_bytes().to_vec();
+    tail.extend_from_slice(&text("approximate"));
+    tail.extend_from_slice(&text("a record that belonged may be missing"));
+
+    let answers = decode_answers(&answer_body(&[records_outcome(&tail)])).expect("this decodes");
+    let [Answer::Records { notes, only, .. }] = answers.as_slice() else {
+        panic!("expected one Records outcome, got {answers:?}");
+    };
+    assert_eq!(notes.len(), 1);
+    assert!(!*only);
+}
