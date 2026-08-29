@@ -23,7 +23,9 @@
 //! work, reach everything, and silently narrow every result — JSON carries six
 //! types — and nothing at the call site would show what was lost.
 //!
-//! This first cut implements the **wire half**.
+//! The wire half is [`Client`]. The HTTP half begins at [`Operations`], which
+//! currently reaches the operational routes; the object and file surface is not
+//! written yet.
 //!
 //! # There is no TLS on this protocol
 //!
@@ -68,6 +70,7 @@
 
 pub mod codec;
 pub mod geometry;
+pub mod http;
 pub mod mapping;
 pub mod query;
 pub mod value;
@@ -81,6 +84,7 @@ pub use crate::client::Client;
 pub use crate::error::{EncodingFault, Error, Result};
 pub use crate::feed::Feed;
 pub use crate::geometry::{Geometry, Polygon, Position, Ring};
+pub use crate::http::Operations;
 pub use crate::mapping::{FromRecord, FromValue, MappingFault, Row};
 pub use crate::value::{Number, RecordId, RecordRef, Value, ValueRange};
 pub use crate::wire::message::{Answer, Names, Note, Parameters, Request};

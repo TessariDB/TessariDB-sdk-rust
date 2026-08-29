@@ -49,7 +49,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use tessaridb_client::{
-    Answer, Became, Change, Client, Feed, Follow, FromRecord, MappingFault, Number, Row, Value,
+    Answer, Became, Change, Client, Error, Feed, Follow, FromRecord, MappingFault, Number,
+    Operations, Row, Value,
 };
 
 /// How long a node gets to bind its port before the test gives up.
@@ -525,4 +526,117 @@ async fn the_table_filter_excludes_a_table_it_was_not_given() {
             break;
         }
     }
+}
+
+/// A node serving the HTTP surface as well as the wire protocol.
+///
+/// A separate constructor rather than a flag on [`Node::start`]: the HTTP
+/// surface is a second port, and every wire test would otherwise pay for a
+/// listener it never touches.
+struct HttpNode {
+    child: Child,
+    address: String,
+}
+
+impl HttpNode {
+    async fn start() -> Self {
+        let binary = std::env::var("TESSARIDB_BIN").unwrap_or_else(|_| {
+            panic!(
+                "TESSARIDB_BIN is not set.\n\
+                 These tests exercise a real node and have nothing to fall back \
+                 on. Set it to the shipped binary and run with `--ignored`."
+            )
+        });
+
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap_or_else(|e| panic!("could not find a free port: {e}"));
+            probe.local_addr().unwrap().port()
+        };
+        let address = format!("127.0.0.1:{port}");
+
+        let child = Command::new(&binary)
+            .arg("--http")
+            .arg(&address)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("could not start {binary}: {e}"));
+
+        let node = Self { child, address };
+        let started = std::time::Instant::now();
+        loop {
+            if tokio::net::TcpStream::connect(&node.address).await.is_ok() {
+                return node;
+            }
+            assert!(
+                started.elapsed() < STARTUP_BUDGET,
+                "the node did not accept a connection on {} within {STARTUP_BUDGET:?}",
+                node.address
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn operations(&self) -> Operations {
+        Operations::at(&self.address)
+    }
+}
+
+impl Drop for HttpNode {
+    fn drop(&mut self) {
+        // By handle, never by name — the database's own suites run this binary.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn the_nodes_own_metrics_come_back_over_http() {
+    // U04 of the SGE inventory, and the route that proves the transport: it is
+    // the one open-auth route that answers `text/plain`, so it exercises the
+    // whole request/response path without also settling the JSON question.
+    let node = HttpNode::start().await;
+
+    let metrics = node
+        .operations()
+        .metrics()
+        .await
+        .expect("the node should answer /metrics");
+
+    // Asserted on content, not on length. A body that came back empty, or a
+    // status page from something else entirely, would satisfy `!is_empty()`.
+    assert!(
+        metrics.contains("# HELP") || metrics.contains("# TYPE"),
+        "this should be the Prometheus text format the node emits; got {} bytes \
+         beginning {:?}",
+        metrics.len(),
+        metrics.chars().take(80).collect::<String>()
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn a_peer_that_is_not_speaking_http_is_refused_rather_than_mis_read() {
+    // Pointed at the WIRE port, which accepts the connection and then answers
+    // with something that is not an HTTP response at all.
+    //
+    // This is the failure worth pinning: the transport reads a status line, and
+    // a reader that shrugged at an unrecognised one would carry on into the
+    // header loop and return a plausible empty answer. `/metrics` returning ""
+    // reads as "this node has no metrics" rather than "you asked the wrong
+    // port", and nothing downstream could tell the difference.
+    let wire_only = Node::start().await;
+    let operations = Operations::at(&wire_only.address);
+
+    let refused = operations
+        .metrics()
+        .await
+        .expect_err("the wire port does not speak HTTP, so this must not succeed");
+
+    assert!(
+        matches!(refused, Error::NotThisProtocol | Error::Truncated),
+        "the refusal should name what went wrong; got {refused:?}"
+    );
 }
