@@ -92,6 +92,28 @@ pub enum Error {
         /// The node's own words.
         message: String,
     },
+
+    /// An HTTP route refused, and the status is how a caller tells why.
+    ///
+    /// Separate from [`Error::Refused`] because it carries something that one
+    /// cannot: a status code. The protocol enumerates thirteen refusals by
+    /// status and says in as many words that a client branches on the code and
+    /// never on the sentence — the sentence is written for a person and embeds
+    /// the caller's own input. A variant that offered only the message would
+    /// leave a caller parsing prose to do what the protocol says to do with an
+    /// integer.
+    ///
+    /// The distinctions that cost the most to miss: **401** means sign in,
+    /// **403** means the grants do not cover this and signing in again never
+    /// will, and **409** means a store-level conflict that is worth retrying
+    /// after a change.
+    #[error("the node answered {status}: {message}")]
+    HttpRefused {
+        /// The status the node sent.
+        status: u16,
+        /// The node's sentence, unwrapped from the JSON that carried it.
+        message: String,
+    },
 }
 
 /// Why a value would not decode.

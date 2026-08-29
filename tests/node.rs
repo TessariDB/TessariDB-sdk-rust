@@ -49,8 +49,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use tessaridb_client::{
-    Answer, Became, Change, Client, Condition, Error, Feed, Follow, FromRecord, MappingFault,
-    Number, Operations, Row, Value,
+    Answer, Became, Bucket, Change, Client, Condition, Error, Feed, Follow, FromRecord,
+    MappingFault, Number, Operations, Row, Value,
 };
 
 /// How long a node gets to bind its port before the test gives up.
@@ -59,6 +59,20 @@ use tessaridb_client::{
 /// not start" into a suite that hangs, which is the failure that costs the most
 /// to diagnose.
 const STARTUP_BUDGET: Duration = Duration::from_secs(10);
+
+/// Held from choosing a port until the node has actually bound it.
+///
+/// Asking the OS for a free port answers a question about *now*: the probe
+/// listener is closed so the child can take the number, and in that gap any
+/// other test asking the same question can be handed the same one. With one port
+/// per node it is a rare loss; with two ports and several nodes starting at once
+/// it stops being rare, and it arrives as a ten-second startup timeout whose
+/// message says nothing about ports.
+///
+/// Serialising the window is what keeps the answer true until it is used. It
+/// costs the suite a few hundred milliseconds in total, and node startup was
+/// never the expensive part.
+static STARTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A node started for one test, and stopped when that test ends.
 struct Node {
@@ -79,6 +93,8 @@ impl Node {
                  Set it to the shipped binary and run with `--ignored`."
             )
         });
+
+        let _slot = STARTING.lock().await;
 
         // Port 0 asks the OS for one that is free, which is what lets these run
         // beside the database's own suites — those bind fixed ports, and a fixed
@@ -533,9 +549,16 @@ async fn the_table_filter_excludes_a_table_it_was_not_given() {
 /// A separate constructor rather than a flag on [`Node::start`]: the HTTP
 /// surface is a second port, and every wire test would otherwise pay for a
 /// listener it never touches.
+///
+/// Both ports, because the object routes need a namespace, a database and a
+/// bucket to exist before they will do anything, and there is no way to declare
+/// those over HTTP that this client offers — `/script` is a route the SDK does
+/// not produce. So the fixture is written over the wire and read over HTTP,
+/// which is also the arrangement a caller ends up with.
 struct HttpNode {
     child: Child,
     address: String,
+    wire: String,
 }
 
 impl HttpNode {
@@ -548,31 +571,62 @@ impl HttpNode {
             )
         });
 
-        let port = {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap_or_else(|e| panic!("could not find a free port: {e}"));
-            probe.local_addr().unwrap().port()
-        };
-        let address = format!("127.0.0.1:{port}");
+        let _slot = STARTING.lock().await;
+
+        // Both probes are held at once and released together. Asking twice in
+        // succession, releasing each before the next, lets the OS hand back the
+        // number it just took away — and the node is then told to bind one port
+        // for two surfaces.
+        let http_probe = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|e| panic!("could not find a free port: {e}"));
+        let wire_probe = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|e| panic!("could not find a second free port: {e}"));
+        let address = format!("127.0.0.1:{}", http_probe.local_addr().unwrap().port());
+        let wire = format!("127.0.0.1:{}", wire_probe.local_addr().unwrap().port());
+        assert_ne!(address, wire, "the two surfaces need two ports");
+        drop(http_probe);
+        drop(wire_probe);
 
         let child = Command::new(&binary)
             .arg("--http")
             .arg(&address)
+            .arg("--serve")
+            .arg(&wire)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap_or_else(|e| panic!("could not start {binary}: {e}"));
 
-        let node = Self { child, address };
+        let mut node = Self {
+            child,
+            address,
+            wire,
+        };
+        // Both ports, because a test that writes its fixture over the wire the
+        // instant the HTTP port answers is racing a listener that has not bound
+        // yet — and it would fail perhaps one run in fifty, which is the worst
+        // rate for finding out why.
         let started = std::time::Instant::now();
         loop {
-            if tokio::net::TcpStream::connect(&node.address).await.is_ok() {
+            let http_up = tokio::net::TcpStream::connect(&node.address).await.is_ok();
+            let wire_up = tokio::net::TcpStream::connect(&node.wire).await.is_ok();
+            if http_up && wire_up {
                 return node;
             }
+            // Whether the child is still running separates "slow to bind" from
+            // "refused to start and exited", which are the same ten-second
+            // silence from out here and want opposite things looked at.
+            let alive = match node.child.try_wait() {
+                Ok(None) => "still running".to_owned(),
+                Ok(Some(status)) => format!("already exited with {status}"),
+                Err(e) => format!("could not be asked: {e}"),
+            };
             assert!(
                 started.elapsed() < STARTUP_BUDGET,
-                "the node did not accept a connection on {} within {STARTUP_BUDGET:?}",
-                node.address
+                "the node ({alive}, http {http_up}, wire {wire_up}) did not accept \
+                 connections on {} and {} within {STARTUP_BUDGET:?}",
+                node.address,
+                node.wire
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -580,6 +634,28 @@ impl HttpNode {
 
     fn operations(&self) -> Operations {
         Operations::at(&self.address)
+    }
+
+    /// Declare a namespace, a database and a bucket, and hand back the bucket.
+    ///
+    /// Written over the wire because the object routes refuse until these exist,
+    /// and because a bucket is not a table: `DEFINE TABLE files` of the same
+    /// name is refused by the node with *"files is not a bucket"*, which is a
+    /// distinction this fixture would otherwise get wrong silently.
+    async fn bucket(&self) -> Bucket {
+        let mut client = Client::connect(&self.wire)
+            .await
+            .unwrap_or_else(|e| panic!("could not reach the wire port at {}: {e}", self.wire));
+        client
+            .run(
+                "DEFINE NAMESPACE app; USE NAMESPACE app; \
+                 DEFINE DATABASE main; USE DATABASE main; \
+                 DEFINE BUCKET files;",
+                None,
+            )
+            .await
+            .expect("the node should accept a namespace, a database and a bucket");
+        self.operations().bucket("app", "main", "files")
     }
 
     /// Ask the node to stop, and return while it is still serving.
@@ -740,4 +816,186 @@ async fn readiness_and_health_diverge_when_the_node_is_leaving() {
         matches!(health, Condition::Ok { .. }),
         "a node that is leaving is not thereby unwell; got {health:?}"
     );
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn a_file_written_through_the_sdk_reads_back_byte_for_byte() {
+    // U09 and U11 of the SGE inventory, together, because neither is observable
+    // alone: a write that reported success and stored nothing looks exactly like
+    // a write that worked until something reads it back.
+    let node = HttpNode::start().await;
+    let bucket = node.bucket().await;
+
+    bucket
+        .put("notes.txt", b"the node keeps what it is given")
+        .await
+        .expect("a bucket that exists should take a file");
+
+    let read = bucket
+        .get("notes.txt")
+        .await
+        .expect("reading a file just written should not fail");
+    assert_eq!(
+        read.as_deref(),
+        Some(b"the node keeps what it is given".as_slice()),
+        "the file should come back exactly as it went in"
+    );
+
+    // Bytes that are not text, because a transport that stringified the body
+    // somewhere would pass the assertion above and fail this one. 0xFF and 0xFE
+    // are not valid UTF-8 in any position.
+    let raw: &[u8] = &[0x00, 0x01, 0xFF, 0xFE];
+    bucket
+        .put("raw.bin", raw)
+        .await
+        .expect("a file is bytes, not text");
+    assert_eq!(
+        bucket.get("raw.bin").await.expect("it was just written"),
+        Some(raw.to_vec()),
+        "bytes that are not UTF-8 must survive the round trip unchanged"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn an_absent_file_and_an_empty_file_are_different_answers() {
+    // The distinction the node draws and a client can lose: absent answers 404,
+    // and empty answers 200 with a declared length of zero. A `get` that
+    // returned an empty vector for both would be wrong in a way no assertion
+    // about a written file could ever catch.
+    let node = HttpNode::start().await;
+    let bucket = node.bucket().await;
+
+    assert_eq!(
+        bucket
+            .get("was-never-written.txt")
+            .await
+            .expect("a missing file is an answer, not a failure"),
+        None,
+        "a file that does not exist should read as nothing, and not as an error"
+    );
+
+    bucket
+        .put("empty.bin", b"")
+        .await
+        .expect("a file may be empty");
+    assert_eq!(
+        bucket.get("empty.bin").await.expect("it exists now"),
+        Some(Vec::new()),
+        "an empty file exists, and must not read the same as one that does not"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn a_refusal_carries_the_status_and_not_the_json_that_wrapped_it() {
+    // The protocol enumerates its refusals by status code and says a client
+    // branches on the code, never on the sentence. So the status has to survive
+    // as a number a caller can match on — and the sentence has to arrive as a
+    // sentence rather than as the JSON object it travelled in.
+    //
+    // Reached through the public API rather than through a raw-path escape
+    // hatch: a hyphen is outside the `[A-Za-z0-9_]+` the node allows in a name,
+    // so this is a refusal a caller can actually provoke by mistake.
+    let node = HttpNode::start().await;
+    let bucket = node.operations().bucket("app", "main", "not-a-name");
+
+    let refused = bucket
+        .get("anything.txt")
+        .await
+        .expect_err("a bucket name the node will not accept must not succeed");
+
+    let Error::HttpRefused { status, message } = refused else {
+        panic!("an HTTP refusal should say so and carry its status; got {refused:?}");
+    };
+    assert_eq!(
+        status, 400,
+        "the node answers 400 for a name it will not take"
+    );
+    assert!(
+        !message.contains('{') && !message.contains("\"error\""),
+        "the message should be the node's sentence, not the JSON around it; got {message:?}"
+    );
+    assert!(
+        !message.is_empty(),
+        "unwrapping the JSON must not throw the sentence away as well"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn a_file_name_that_needs_encoding_survives_the_round_trip() {
+    // Three characters, each breaking differently if the client leaves it raw:
+    // a space makes the request line unparseable, a percent asks the node to
+    // decode an escape that is not one, and a slash is part of the name rather
+    // than a directory and must reach the node as itself.
+    let node = HttpNode::start().await;
+    let bucket = node.bucket().await;
+
+    let awkward = "holiday photos/100% done.txt";
+    bucket
+        .put(awkward, b"encoded and decoded")
+        .await
+        .expect("a file may be called anything at all");
+
+    assert_eq!(
+        bucket
+            .get(awkward)
+            .await
+            .expect("the same name must reach the same file"),
+        Some(b"encoded and decoded".to_vec()),
+        "a name needing encoding must round-trip through it"
+    );
+
+    // The neighbouring name, to show the encoding is reversible rather than
+    // merely consistent: if the client encoded a space as something the node
+    // decodes to something else, both calls above would still agree with each
+    // other while naming a file nobody asked for.
+    assert_eq!(
+        bucket
+            .get("holiday photos/100%25 done.txt")
+            .await
+            .expect("this asks for a different file, which does not exist"),
+        None,
+        "a percent that was already an escape must not collide with one that was not"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn deleting_a_file_removes_it_and_deleting_it_again_is_still_fine() {
+    // U15. The node answers 204 whether or not the file was there and reports no
+    // difference between the two, so idempotence is what the client can honestly
+    // promise — and a caller who has to guess will write the wrong retry.
+    let node = HttpNode::start().await;
+    let bucket = node.bucket().await;
+
+    bucket
+        .put("temporary.txt", b"here for now")
+        .await
+        .expect("the file should be written");
+    assert!(
+        bucket
+            .get("temporary.txt")
+            .await
+            .expect("it exists")
+            .is_some(),
+        "the file must be there before deleting it proves anything"
+    );
+
+    bucket
+        .delete("temporary.txt")
+        .await
+        .expect("deleting a file that is there should succeed");
+    assert_eq!(
+        bucket.get("temporary.txt").await.expect("asking is fine"),
+        None,
+        "the file should be gone"
+    );
+
+    bucket
+        .delete("temporary.txt")
+        .await
+        .expect("deleting a file that is already gone should also succeed");
 }

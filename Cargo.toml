@@ -32,7 +32,18 @@ thiserror = "2"
 serde_json = "1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time"] }
+# `sync` is here and deliberately not above: the real-node tests serialise the
+# window between asking the OS for a free port and the child binding it, and an
+# async mutex is what holds that window open across the wait. A development
+# dependency does not reach anyone who depends on this crate.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-util",
+    "net",
+    "time",
+    "sync",
+] }
 
 [lints.rust]
 missing_docs = "warn"

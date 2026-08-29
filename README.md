@@ -14,7 +14,7 @@
 
 > [!WARNING]
 > **Under active development, and not ready for production.** Unpublished to
-> crates.io; the HTTP half of the client is not written yet, and the API changes
+> crates.io; the HTTP half of the client is partly written, and the API changes
 > without notice. See [**Status**](#status).
 
 ```toml
@@ -49,7 +49,10 @@ the application you build with this crate.
 - ✅ **Runs:** the wire half — connect, run statements with bound parameters,
   decode every value type, subscribe to changes, and build the four common
   statements.
-- 🚧 **Next:** the HTTP half — objects, files, backup, health.
+- ✅ **Runs:** part of the HTTP half — health, readiness, metrics, and writing,
+  reading and deleting a file in a bucket.
+- 🚧 **Next:** the rest of the HTTP half — the bucket listing, backup, and
+  credentials.
 - ⚠️ **Unstable:** the public API changes without notice while the server it
   talks to is pre-1.0.
 
@@ -156,7 +159,9 @@ not a mystery.
   cannot know it was safe to repeat.
 - **The change subscription** — what changed, delivered as it happens.
 - **Typed rows** — answers mapped into your own structs.
-- **Objects and files** — put, get, byte ranges, list, delete.
+- **Objects and files** — put, get, list, delete. Not byte ranges: this version
+  of the protocol has neither ranges nor resumption, and a client cannot own what
+  the protocol does not carry.
 - **The operational routes** — health, readiness, metrics.
 - **The query builder** — re-exported from here, not a second dependency you are
   told to also add.

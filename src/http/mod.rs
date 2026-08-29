@@ -41,14 +41,17 @@
 //! something that terminates TLS.
 
 mod condition;
+mod object;
 mod reply;
 
+use serde_json::Value as Json;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::error::{Error, Result};
 
 pub use crate::http::condition::Condition;
+pub use crate::http::object::Bucket;
 use crate::http::reply::Reply;
 
 /// The node's operational surface.
@@ -73,6 +76,22 @@ impl Operations {
         }
     }
 
+    /// The bucket of this name, in this database, in this namespace.
+    ///
+    /// Nothing is checked here and nothing is reached: the three names are
+    /// carried to the node, which is the only party that knows whether they
+    /// exist. A bucket must have been declared with `DEFINE BUCKET` — a table of
+    /// the same name is refused, and refused by the node rather than guessed at
+    /// here (LR-SDK-004).
+    pub fn bucket(
+        &self,
+        namespace: impl Into<String>,
+        database: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Bucket {
+        Bucket::new(self.clone(), namespace, database, name)
+    }
+
     /// What the node reports about itself, in the Prometheus text format.
     ///
     /// Returned as the node wrote it. Parsing it here would mean this crate
@@ -81,8 +100,8 @@ impl Operations {
     ///
     /// # Errors
     ///
-    /// [`Error::Refused`] naming the status when the node answers with one that
-    /// is not a success, and whatever the transport reports otherwise.
+    /// [`Error::HttpRefused`] carrying the status when the node answers with one
+    /// that is not a success, and whatever the transport reports otherwise.
     pub async fn metrics(&self) -> Result<String> {
         let reply = self.get("/metrics").await?;
         String::from_utf8(reply.body).map_err(|_| Error::Malformed)
@@ -127,40 +146,28 @@ impl Operations {
     /// message to tell it apart from a wrong address. Every other status is
     /// still a refusal.
     async fn condition(&self, path: &str) -> Result<Condition> {
-        let reply = self.send("GET", path).await?;
+        let reply = self.send("GET", path, None).await?;
         if reply.status != 200 && reply.status != 503 {
-            return Err(Self::refusal(path, &reply));
+            return Err(refusal(&reply));
         }
         Condition::read(&reply.body)
     }
 
     /// Issue a GET and insist on a successful status.
     async fn get(&self, path: &str) -> Result<Reply> {
-        let reply = self.send("GET", path).await?;
+        let reply = self.send("GET", path, None).await?;
         if !(200..300).contains(&reply.status) {
-            return Err(Self::refusal(path, &reply));
+            return Err(refusal(&reply));
         }
         Ok(reply)
     }
 
-    /// The node said no.
-    ///
-    /// The status is carried into the message rather than mapped onto a variant
-    /// per code. A caller acts on the distinction between "the node said no" and
-    /// "the network said no", and this crate already draws that line at
-    /// [`Error::Refused`].
-    fn refusal(path: &str, reply: &Reply) -> Error {
-        Error::Refused {
-            message: format!(
-                "the node answered {} for {path}: {}",
-                reply.status,
-                String::from_utf8_lossy(&reply.body).trim()
-            ),
-        }
-    }
-
     /// Connect, write one request, read one response, drop the connection.
-    async fn send(&self, method: &str, path: &str) -> Result<Reply> {
+    ///
+    /// `body` is `None` for a request that carries none, which is not the same
+    /// as `Some(&[])`: an empty file is written by declaring a length of zero,
+    /// and a request with no `Content-Length` at all is a different request.
+    async fn send(&self, method: &str, path: &str, body: Option<&[u8]>) -> Result<Reply> {
         let mut stream = TcpStream::connect(&self.address).await?;
         stream.set_nodelay(true)?;
 
@@ -168,11 +175,18 @@ impl Operations {
         // says this connection carries one exchange — which is true, and saying
         // so lets the node release it rather than hold it open for a reuse that
         // is not coming.
+        let length = match body {
+            Some(bytes) => format!("Content-Length: {}\r\n", bytes.len()),
+            None => String::new(),
+        };
         let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n{length}\r\n",
             self.address
         );
         stream.write_all(request.as_bytes()).await?;
+        if let Some(bytes) = body {
+            stream.write_all(bytes).await?;
+        }
         stream.flush().await?;
 
         let mut reader = BufReader::new(stream);
@@ -181,4 +195,35 @@ impl Operations {
         // after the headers, so a reader that trusts the header waits forever.
         reply::read(&mut reader, method != "HEAD").await
     }
+}
+
+/// The node said no, over HTTP, with a status.
+///
+/// The status is carried as a field rather than folded into the sentence. The
+/// protocol enumerates its refusals by code and says a client branches on the
+/// code, so a client that offered only prose would be handing the caller the one
+/// thing it was told not to parse.
+fn refusal(reply: &Reply) -> Error {
+    Error::HttpRefused {
+        status: reply.status,
+        message: sentence(&reply.body),
+    }
+}
+
+/// The node's sentence, unwrapped from the JSON that carried it.
+///
+/// Every refusal the protocol answers as JSON is the same single-field object,
+/// `{"error": "…"}`. Handing that object to a caller as the error message leaves
+/// them reading punctuation, or parsing it a second time — so it is unwrapped
+/// here, once.
+///
+/// The fallback is the body verbatim, for a refusal that is not that shape at
+/// all. Something between the caller and the node — a proxy, a gateway — answers
+/// in its own words, and those words are worth showing rather than replacing
+/// with a sentence this crate invented about a node it never reached.
+fn sentence(body: &[u8]) -> String {
+    serde_json::from_slice::<Json>(body)
+        .ok()
+        .and_then(|json| json.get("error").and_then(Json::as_str).map(str::to_owned))
+        .unwrap_or_else(|| String::from_utf8_lossy(body).trim().to_owned())
 }
