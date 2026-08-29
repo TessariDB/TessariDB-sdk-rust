@@ -68,6 +68,7 @@
 
 pub mod codec;
 pub mod geometry;
+pub mod mapping;
 pub mod query;
 pub mod value;
 pub mod wire;
@@ -80,6 +81,7 @@ pub use crate::client::Client;
 pub use crate::error::{EncodingFault, Error, Result};
 pub use crate::feed::Feed;
 pub use crate::geometry::{Geometry, Polygon, Position, Ring};
+pub use crate::mapping::{FromRecord, FromValue, MappingFault, Row};
 pub use crate::value::{Number, RecordId, RecordRef, Value, ValueRange};
 pub use crate::wire::message::{Answer, Names, Note, Parameters, Request};
 pub use crate::wire::push::{Became, Change, Follow};

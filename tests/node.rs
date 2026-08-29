@@ -48,7 +48,7 @@
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use tessaridb_client::{Answer, Client, Number, Value};
+use tessaridb_client::{Answer, Client, FromRecord, MappingFault, Number, Row, Value};
 
 /// How long a node gets to bind its port before the test gives up.
 ///
@@ -255,5 +255,139 @@ async fn a_bound_value_reaches_a_real_node_as_data_and_never_as_script() {
         field(&found[0].1, "name"),
         &Value::String(hostile.to_owned()),
         "the value came back exactly as sent, having never been read as grammar"
+    );
+}
+
+/// The struct the mapping is aimed at.
+///
+/// Declared here rather than shared with `mapping.rs`: an integration test
+/// binary is its own crate, and a shared fixture between the two would be a
+/// third thing to keep honest for no gain.
+#[derive(Debug, PartialEq)]
+struct User {
+    id: String,
+    name: String,
+    age: i64,
+    nickname: Option<String>,
+}
+
+impl FromRecord for User {
+    fn from_row(mut row: Row) -> Result<Self, MappingFault> {
+        Ok(Self {
+            id: row.id().to_owned(),
+            name: row.take("name")?,
+            age: row.take("age")?,
+            nickname: row.take("nickname")?,
+        })
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn a_real_answer_maps_into_a_declared_struct() {
+    // The mapping's hermetic tests convert values this process built, which
+    // proves the conversions agree with their author. This is the tier that can
+    // disagree: the values here were encoded by the node, crossed a socket, and
+    // were decoded by the codec (LR-SDK-006).
+    let node = Node::start().await;
+    let mut client = node.client().await;
+
+    client
+        .run(
+            &format!(
+                "{PREAMBLE} CREATE users:1 = {{ name: 'ada', age: 36, nickname: 'countess' }}; \
+                 CREATE users:2 = {{ name: 'grace', age: 45 }};"
+            ),
+            None,
+        )
+        .await
+        .expect("the preamble and both writes should be accepted");
+
+    let answers = client
+        .run("SELECT * FROM users;", None)
+        .await
+        .expect("the read should be accepted");
+    let mut users: Vec<User> = answers
+        .into_iter()
+        .next()
+        .expect("one statement, one answer")
+        .records_into()
+        .expect("the records map into the declared struct");
+    users.sort_by(|left, right| left.id.cmp(&right.id));
+
+    assert_eq!(
+        users,
+        vec![
+            User {
+                id: "1".to_owned(),
+                name: "ada".to_owned(),
+                age: 36,
+                nickname: Some("countess".to_owned()),
+            },
+            User {
+                id: "2".to_owned(),
+                name: "grace".to_owned(),
+                age: 45,
+                // Written without the field at all. Whether the node answers
+                // with the key missing or with an explicit absent marker, the
+                // caller's `Option` gives the same answer — which is the whole
+                // reason `FromValue::absent` exists.
+                nickname: None,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn a_field_the_node_did_not_write_comes_back_as_no_key_at_all() {
+    // MEASURED 2026-08-30 against the shipped binary: a field that was never
+    // written is **absent from the object**. The node does not send the key
+    // carrying `Value::None`.
+    //
+    // That is the fact this whole design turns on. `FromValue::absent` — the
+    // default method that lets `Option<T>` answer for a key that is not there —
+    // is not an ergonomic nicety here; without it EVERY optional field would
+    // report `NoSuchField` against a real node, and `Option` would mean
+    // "nullable" while being unable to express "optional".
+    //
+    // The mapping accepts the other shape too, because accepting it costs
+    // nothing and a store may later write an explicit marker. But this
+    // assertion pins what is true today, so a change on the node's side fails
+    // here loudly instead of quietly altering what `Option` means.
+    let node = Node::start().await;
+    let mut client = node.client().await;
+
+    client
+        .run(
+            &format!("{PREAMBLE} CREATE users:1 = {{ name: 'grace' }};"),
+            None,
+        )
+        .await
+        .expect("the preamble and the write should be accepted");
+
+    let answers = client
+        .run("SELECT * FROM users;", None)
+        .await
+        .expect("the read should be accepted");
+    let found = records(&answers[0]);
+    let Value::Object(fields) = &found[0].1 else {
+        panic!("a record holds an object; got {:?}", found[0].1);
+    };
+
+    assert_eq!(
+        fields.get("nickname"),
+        None,
+        "an unwritten field is absent from the object; the node does not send the \
+         key carrying an explicit marker. `FromValue::absent` is what makes \
+         `Option` work against that, so this is the assertion that justifies it"
+    );
+
+    // The neighbouring field is present, which is what stops the assertion above
+    // from passing against a record that came back empty for some other reason.
+    assert_eq!(
+        fields.get("name"),
+        Some(&Value::String("grace".to_owned())),
+        "the record did arrive and does carry the field that was written"
     );
 }
