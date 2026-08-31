@@ -120,6 +120,45 @@ fn a_create_binds_its_identity_and_all_its_fields() {
 }
 
 #[test]
+fn a_create_in_a_table_leaves_the_identity_to_the_store() {
+    let query = Create::in_table("memories")
+        .set("body", "the user prefers metric units")
+        .set("weight", 3_i64)
+        .build()
+        .expect("well formed");
+
+    // The target is the bare table, and the fields therefore number from $p0
+    // rather than $p1 — there is no identity ahead of them in the binder.
+    assert_eq!(
+        query.script,
+        "CREATE memories = { body: $p0, weight: $p1 };"
+    );
+    assert_eq!(query.parameters.len(), 2);
+}
+
+#[test]
+fn the_generated_form_refuses_a_table_that_is_not_a_name() {
+    // The named form gets its check from `record_target`, which this path does
+    // not call. A generated form that skipped the check would write a caller's
+    // text straight into the statement, where a table position accepts far more
+    // than a table name.
+    let error = Create::in_table("users; DROP")
+        .set("body", 1_i64)
+        .build()
+        .expect_err("a table is a name");
+    assert!(
+        matches!(
+            error,
+            BuildError::NotAName {
+                what: "a table",
+                ..
+            }
+        ),
+        "got {error:?}"
+    );
+}
+
+#[test]
 fn an_update_sets_named_fields_rather_than_replacing_the_record() {
     // The distinction is the whole reason `Update` emits SET: a builder with a
     // `set` method that quietly replaced the record would destroy every field

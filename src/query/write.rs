@@ -25,7 +25,7 @@ use crate::value::Value;
 #[derive(Debug, Clone)]
 pub struct Create {
     table: String,
-    id: Value,
+    id: Option<Value>,
     fields: BTreeMap<String, Value>,
 }
 
@@ -35,7 +35,41 @@ impl Create {
     pub fn record(table: impl Into<String>, id: impl Into<Value>) -> Self {
         Self {
             table: table.into(),
-            id: id.into(),
+            id: Some(id.into()),
+            fields: BTreeMap::new(),
+        }
+    }
+
+    /// A record in a table, letting the store name it.
+    ///
+    /// The store allocates the identity and answers with it, so the caller does
+    /// not have to invent one that is unique. Prefer this: an identity a caller
+    /// invents is a uniqueness problem the caller now owns, and the usual
+    /// answers to it — a counter kept somewhere else, a timestamp, a random
+    /// number long enough to feel safe — are all worse than the one the store
+    /// keeps per table.
+    ///
+    /// [`record`](Self::record) stays for the case that actually needs it: an
+    /// identity that came from outside and means something there, like an order
+    /// number or an account id.
+    ///
+    /// ```
+    /// use tessaridb_client::query::Create;
+    ///
+    /// let query = Create::in_table("memories")
+    ///     .set("body", "the user prefers metric units")
+    ///     .build()
+    ///     .expect("a well-formed query");
+    ///
+    /// // No identity in the script, because the caller never had one.
+    /// assert!(query.script.starts_with("CREATE memories = {"));
+    /// assert!(!query.script.contains("memories:"));
+    /// ```
+    #[must_use]
+    pub fn in_table(table: impl Into<String>) -> Self {
+        Self {
+            table: table.into(),
+            id: None,
             fields: BTreeMap::new(),
         }
     }
@@ -55,7 +89,15 @@ impl Create {
             });
         }
         let mut binder = Binder::new();
-        let target = record_target(&self.table, self.id.clone(), &mut binder)?;
+        // The bare table is the whole difference between the two forms, and it
+        // is checked as a name here because `record_target` — the only other
+        // place that writes a table into a script — is not on this path.
+        let target = if let Some(id) = self.id.clone() {
+            record_target(&self.table, id, &mut binder)?
+        } else {
+            check_name("a table", &self.table)?;
+            self.table.clone()
+        };
         let body = render_object(&self.fields, &mut binder)?;
         Ok(Query {
             script: format!("CREATE {target} = {body};"),
