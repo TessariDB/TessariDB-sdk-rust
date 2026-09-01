@@ -1396,3 +1396,88 @@ async fn a_wrong_current_password_changes_nothing_at_all() {
         "and the password the refused call proposed must never have been set"
     );
 }
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn a_backup_carries_the_store_and_the_incremental_carries_less_of_it() {
+    // U05 and U06, and the pair is the point. Either test alone proves only that
+    // a route answered: a full backup asserted non-empty would pass on a method
+    // that always fetched everything, and an incremental asserted non-empty
+    // would pass on one that ignored its query entirely. What no single call can
+    // fake is the two answers **differing in the direction the sequence
+    // predicts**, which is the semantics rather than the existence.
+    let node = HttpNode::start_closed(OWNER.0, OWNER.1).await;
+    node.closed_fixture().await;
+    let operations = node.operations().as_user(OWNER.0, OWNER.1);
+
+    let mut whole = Vec::new();
+    let written = operations
+        .backup(&mut whole)
+        .await
+        .expect("the owner of a closed store may take a backup");
+
+    assert!(
+        !whole.is_empty(),
+        "a store with a fixture in it is not empty"
+    );
+    assert_eq!(
+        usize::try_from(written).expect("a fixture backup fits"),
+        whole.len(),
+        "the returned count is the bytes the caller actually received, not the \
+         length the node declared"
+    );
+
+    // Far past anything this fixture committed, so the node has nothing after it
+    // to send — but **not** `u64::MAX`, which is measured to come back `400`
+    // *"18446744073709551615 … is not a number this store can hold"*. The route
+    // parses the query as a `u64` and the language then refuses the statement it
+    // was folded into, so the two disagree about the domain and the client sits
+    // on the wider side of it.
+    let mut since = Vec::new();
+    operations
+        .backup_from(1_000_000, &mut since)
+        .await
+        .expect("an incremental backup from beyond the end is still an answer");
+
+    assert!(
+        since.len() < whole.len(),
+        "`from=` has to reach the node and change what it sends; got {} bytes \
+         against {} for the whole store",
+        since.len(),
+        whole.len()
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn a_refused_backup_leaves_the_callers_sink_untouched() {
+    // The criterion that fails silently rather than loudly. A refusal returns
+    // `Err` whether or not its body was copied, so the error alone proves
+    // nothing; the sink is the only observation that separates a clean refusal
+    // from one that wrote `{"error":…}` into what the caller believes is a
+    // backup file.
+    //
+    // On a **closed** store deliberately. On an open one this call succeeds
+    // without a credential and hands back the whole log, which is the node's
+    // decision and not this client's to override.
+    let node = HttpNode::start_closed(OWNER.0, OWNER.1).await;
+    node.closed_fixture().await;
+
+    let mut sink = Vec::new();
+    let refused = node
+        .operations()
+        .backup(&mut sink)
+        .await
+        .expect_err("a closed store must not hand a backup to an anonymous caller");
+
+    assert_eq!(
+        refusal_status(&refused),
+        401,
+        "an absent credential is 401 — the status that means *present one*"
+    );
+    assert!(
+        sink.is_empty(),
+        "the refusal body must not reach the sink; got {} bytes",
+        sink.len()
+    );
+}

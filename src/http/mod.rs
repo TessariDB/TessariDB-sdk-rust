@@ -46,7 +46,7 @@ mod object;
 mod reply;
 
 use serde_json::Value as Json;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::error::{Error, Result};
@@ -155,10 +155,16 @@ impl Operations {
     /// property holds by construction: the `POST` synonym and the ranged write,
     /// the two calls that would break it, are deliberately not offered.
     ///
-    /// [`change_password`](Self::change_password) is the one exception and is
-    /// exempt rather than covered — a retry there re-sends a credential the
-    /// first attempt may already have invalidated, so it never reaches this
-    /// loop at all.
+    /// **Two calls are exempt rather than covered**, and they never reach this
+    /// loop. [`change_password`](Self::change_password), because a retry there
+    /// re-sends a credential the first attempt may already have invalidated.
+    /// [`backup`](Self::backup), because its answer is not a value this client
+    /// discards and replaces — it has already been written to the caller's sink,
+    /// so a second attempt appends a second copy behind the partial first one.
+    ///
+    /// The pair is worth reading together: retry safety is a property of each
+    /// call, never of a transport, and these are the two ways a request on an
+    /// otherwise idempotent surface stops having it.
     ///
     /// **Anything the node actually said is not retried.** A `401` retried is a
     /// loop and a `403` retried is a longer one, and `Malformed`, `TooLarge` and
@@ -294,6 +300,122 @@ impl Operations {
         Ok(())
     }
 
+    /// Take a backup of the whole store, writing it to `sink`.
+    ///
+    /// Answers the number of bytes written.
+    ///
+    /// # Why this one takes a writer when nothing else here does
+    ///
+    /// Every other route on this surface answers something whose size is known
+    /// before it is asked for — a health object, a metrics page, a refusal, or a
+    /// file the caller wrote themselves. This one answers the store's whole log,
+    /// and on any store worth backing up that is larger than the 16 MiB this
+    /// client will hold in memory. Returning `Vec<u8>` would have produced a
+    /// method that works in its own tests and refuses every real store; raising
+    /// the limit for one route would have traded that refusal for an
+    /// out-of-memory kill. Streaming needs no limit, because nothing is allocated
+    /// in proportion to the answer.
+    ///
+    /// A caller who does want the bytes in memory has lost nothing: `Vec<u8>` is
+    /// itself a sink.
+    ///
+    /// # What the node decides, and this client does not
+    ///
+    /// `BACKUP` is a statement, and this route is a surface over it rather than a
+    /// second implementation — so **who may take a backup is the language's
+    /// answer**, given once. The statement needs an owner, and a grant-governed
+    /// user is refused by name. A backup is every table at once, which is exactly
+    /// why an endpoint deciding that for itself would be a second answer to a
+    /// question already settled.
+    ///
+    /// Note the posture rule that applies here as everywhere: on a store with no
+    /// user declared, this call **succeeds without a credential**, because there
+    /// is no one for the node to refuse.
+    ///
+    /// # A refusal is never written to the sink
+    ///
+    /// The status decides before any byte moves. A `401` writes nothing, leaving
+    /// the sink exactly as it was found — which matters more here than anywhere
+    /// else on this surface, since a refusal copied into a backup file produces
+    /// sixty plausible bytes that fail at restore rather than at the call.
+    ///
+    /// # This call is never retried
+    ///
+    /// [`attempts`](Self::attempts) does not reach it, and the reason is not
+    /// [`change_password`](Self::change_password)'s. Retrying is safe elsewhere
+    /// on this surface because a repeated request produces a fresh answer that
+    /// replaces the first. Here the first answer is **already in the caller's
+    /// writer**: a retry after a transport failure at three megabytes appends a
+    /// second copy behind the partial one and reports success over a corrupt
+    /// file.
+    ///
+    /// So a failure mid-copy is [`Error::Truncated`] **with bytes already
+    /// written**, and that is the honest report rather than an oversight —
+    /// nothing here can un-write another party's sink. A caller writing to a file
+    /// discards it and asks again.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::HttpRefused`] carrying the node's status and sentence, with the
+    /// sink untouched. [`Error::Io`] from **either side** — a dropped connection
+    /// and a full disk arrive as the same variant, which is worth knowing before
+    /// treating one as the other.
+    pub async fn backup<W>(&self, sink: &mut W) -> Result<u64>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        self.backed_up("/backup", sink).await
+    }
+
+    /// Take a backup of everything committed **after** `from`, writing it to `sink`.
+    ///
+    /// The node's incremental: `BACKUP FROM <sequence>`, where the sequence is a
+    /// commit position rather than a byte offset. It is not a resume — a copy
+    /// that failed halfway is restarted, not continued — and this client offers
+    /// no resume because the node offers nothing to build one from.
+    ///
+    /// # The route and the language disagree about how large a sequence can be
+    ///
+    /// Measured, and stated because it is surprising. The route reads this query
+    /// as a `u64`, so this parameter is one; the statement it is folded into is
+    /// then read by the language, whose integers are narrower. A sequence past
+    /// that comes back `400` — *"18446744073709551615 … is not a number this
+    /// store can hold"* — which is a refusal about the **value** rather than
+    /// about the caller or the store.
+    ///
+    /// This client does not narrow the type to hide it. A sequence comes from a
+    /// previous backup rather than from arithmetic, so the range is not one a
+    /// caller reaches by accident, and clamping here would replace a clear
+    /// sentence from the node with a silent adjustment nobody asked for.
+    ///
+    /// # Errors
+    ///
+    /// As [`backup`](Self::backup), plus `400` for a sequence the store cannot
+    /// hold.
+    pub async fn backup_from<W>(&self, from: u64, sink: &mut W) -> Result<u64>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        self.backed_up(&format!("/backup?from={from}"), sink).await
+    }
+
+    /// Both backup routes, which differ only in their query.
+    async fn backed_up<W>(&self, path: &str, sink: &mut W) -> Result<u64>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        // `stream_into` rather than `send`: one attempt, for the reason given on
+        // `backup`. This and `change_password` are the only callers on the type
+        // that reach past the retry loop.
+        let reply = self.stream_into(path, sink).await?;
+        if reply.status != 200 {
+            return Err(refusal(&reply));
+        }
+        // Present whenever a body was copied — the streaming reader requires a
+        // declared length before it moves a byte.
+        reply.length.ok_or(Error::Malformed)
+    }
+
     /// The bucket of this name, in this database, in this namespace.
     ///
     /// Nothing is checked here and nothing is reached: the three names are
@@ -406,6 +528,46 @@ impl Operations {
     /// to decide what a half-written request means, and the answer is that this
     /// connection is finished either way.
     async fn exchange(&self, method: &str, path: &str, body: Option<&[u8]>) -> Result<Reply> {
+        let mut reader = self.open(method, path, body).await?;
+        // `expects_body` is the method's property, not the response's: a HEAD
+        // answers with the `Content-Length` a GET would carry and sends nothing
+        // after the headers, so a reader that trusts the header is reading bytes
+        // that are never coming.
+        //
+        // **Measured, 2026-09-01**, because this comment used to say "waits
+        // forever" and that is not what happens here: forcing this argument to
+        // `true` fails in milliseconds with `Error::Truncated`, not in a hang.
+        // The reason is `Connection: close` below — the node shuts the socket
+        // after the headers, so `read_exact` hits the end of the stream instead
+        // of blocking on it. The hang is real on a keep-alive connection and
+        // this client has none, which is worth saying plainly rather than
+        // leaving a scarier and wrong claim in place: the next person to weigh
+        // connection reuse should know the failure gets *worse*, not that it is
+        // already the worst.
+        reply::read(&mut reader, method != "HEAD").await
+    }
+
+    /// One connection, one request, and a successful body written straight out.
+    ///
+    /// The streaming twin of [`exchange`](Self::exchange), and separate from it
+    /// because the difference is only in how the answer is read: everything up to
+    /// the first response byte is the same request, built in one place so the two
+    /// paths cannot drift on a header.
+    async fn stream_into<W>(&self, path: &str, sink: &mut W) -> Result<Reply>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let mut reader = self.open("GET", path, None).await?;
+        reply::read_into(&mut reader, sink).await
+    }
+
+    /// Connect and write one request; the caller reads the answer.
+    async fn open(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> Result<BufReader<TcpStream>> {
         let mut stream = TcpStream::connect(&self.address).await?;
         stream.set_nodelay(true)?;
 
@@ -436,23 +598,7 @@ impl Operations {
         }
         stream.flush().await?;
 
-        let mut reader = BufReader::new(stream);
-        // `expects_body` is the method's property, not the response's: a HEAD
-        // answers with the `Content-Length` a GET would carry and sends nothing
-        // after the headers, so a reader that trusts the header is reading bytes
-        // that are never coming.
-        //
-        // **Measured, 2026-09-01**, because this comment used to say "waits
-        // forever" and that is not what happens here: forcing this argument to
-        // `true` fails in milliseconds with `Error::Truncated`, not in a hang.
-        // The reason is `Connection: close` above — the node shuts the socket
-        // after the headers, so `read_exact` hits the end of the stream instead
-        // of blocking on it. The hang is real on a keep-alive connection and
-        // this client has none, which is worth saying plainly rather than
-        // leaving a scarier and wrong claim in place: the next person to weigh
-        // connection reuse should know the failure gets *worse*, not that it is
-        // already the worst.
-        reply::read(&mut reader, method != "HEAD").await
+        Ok(BufReader::new(stream))
     }
 }
 
@@ -910,6 +1056,229 @@ mod tests {
             !shown.contains("s3cr3t") && !shown.contains("YWRtaW46czNjcjN0IHB3"),
             "a bucket carries the handle, and formatting it must not carry the \
              credential out with it; got {shown}"
+        );
+    }
+
+    /// A node whose answer can be larger than this client would ever buffer, and
+    /// which can stop short of what it declared.
+    ///
+    /// One helper for the whole backup surface, because the four things worth
+    /// asserting there are four settings of the same two numbers: `declared` is
+    /// the `Content-Length` it writes and `sent` is how many bytes actually
+    /// follow. Equal, it is an ordinary large answer; `sent` smaller, it is a
+    /// connection that dies mid-body, which is the only way to observe whether
+    /// the call was retried.
+    ///
+    /// Both the requests and the connection count are returned, because C3 and
+    /// C5 cannot be seen from a return value: a refusal is `Err` whether or not
+    /// it scribbled in the sink, and a truncated read is `Err` whether the client
+    /// asked once or three times.
+    async fn serves(
+        status: u16,
+        declared: usize,
+        sent: usize,
+    ) -> (String, Arc<Mutex<Vec<String>>>, Arc<AtomicUsize>) {
+        let socket = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free port for the mock");
+        let address = socket
+            .local_addr()
+            .expect("the mock's own address")
+            .to_string();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&seen);
+        let count = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&count);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = socket.accept().await else {
+                    return;
+                };
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while stream.read_exact(&mut byte).await.is_ok() {
+                    request.push(byte[0]);
+                    if finished(&request) {
+                        break;
+                    }
+                }
+                kept.lock()
+                    .expect("the mock's record")
+                    .push(String::from_utf8_lossy(&request).into_owned());
+
+                let head = format!(
+                    "HTTP/1.1 {status} .\r\nContent-Length: {declared}\r\n\
+                     Connection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&pattern(sent)).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        (address, seen, count)
+    }
+
+    /// `size` bytes that vary along their length.
+    ///
+    /// A constant byte would pass a copy that duplicated or dropped a chunk as
+    /// long as the total came out right; a repeating word does not.
+    fn pattern(size: usize) -> Vec<u8> {
+        const WORD: &[u8] = b"tessaridb-backup";
+        let mut made = Vec::with_capacity(size);
+        while made.len() < size {
+            made.extend_from_slice(WORD);
+        }
+        made.truncate(size);
+        made
+    }
+
+    #[tokio::test]
+    async fn a_backup_is_asked_for_with_the_credential_and_lands_in_the_sink() {
+        // C1. Both halves matter: a method that opened the right route and wrote
+        // nothing would pass an assertion on the request alone.
+        let (address, seen, _) = serves(200, 4096, 4096).await;
+        let mut sink = Vec::new();
+
+        let written = Operations::at(&address)
+            .as_user("admin", "old")
+            .backup(&mut sink)
+            .await
+            .expect("the node answered a backup");
+
+        let request = seen
+            .lock()
+            .expect("the mock's record")
+            .first()
+            .expect("the mock was asked exactly once")
+            .clone();
+        assert!(
+            request.starts_with("GET /backup HTTP/1.1\r\n"),
+            "the whole-store backup takes no query; got {request:?}"
+        );
+        assert!(
+            request.contains(&format!("Authorization: {OLD}\r\n")),
+            "the handle's credential has to reach a route the node authorises; \
+             got {request:?}"
+        );
+        assert_eq!(written, 4096, "the count is what was written");
+        assert_eq!(
+            sink,
+            pattern(4096),
+            "and the bytes are the node's, in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_incremental_backup_names_the_sequence_in_the_query() {
+        // C2. The node refuses any query but this one, so the spelling is the
+        // assertion — `from=7` and nothing else.
+        let (address, seen, _) = serves(200, 32, 32).await;
+        let mut sink = Vec::new();
+
+        Operations::at(&address)
+            .backup_from(7, &mut sink)
+            .await
+            .expect("the node answered an incremental backup");
+
+        let request = seen
+            .lock()
+            .expect("the mock's record")
+            .first()
+            .expect("the mock was asked exactly once")
+            .clone();
+        assert!(
+            request.starts_with("GET /backup?from=7 HTTP/1.1\r\n"),
+            "the sequence is the one query this route takes; got {request:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_backup_writes_nothing_at_all_into_the_sink() {
+        // C3, and the criterion that would fail silently in production: the call
+        // returns `Err` whether or not the refusal was copied, so the assertion
+        // is on the sink. A `{"error":…}` written into a backup file is sixty
+        // plausible bytes that fail at restore rather than at the call.
+        let (address, _, _) = serves(401, 46, 46).await;
+        let mut sink = Vec::new();
+
+        let refused = Operations::at(&address)
+            .backup(&mut sink)
+            .await
+            .expect_err("a 401 is a refusal");
+
+        assert!(
+            matches!(refused, Error::HttpRefused { status: 401, .. }),
+            "the node's own status, carried as a field; got {refused:?}"
+        );
+        assert!(
+            sink.is_empty(),
+            "a refusal body must not reach the caller's writer; got {} bytes",
+            sink.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backup_larger_than_this_client_would_buffer_is_delivered() {
+        // C4, and the reason the wave exists. 17 MiB is over the 16 MiB ceiling
+        // every other route on this surface is held to, so a buffering
+        // implementation fails here with `TooLarge` — which is exactly what
+        // returning `Vec<u8>` would have done to every real store.
+        const OVER: usize = 17 * 1024 * 1024;
+        let (address, _, _) = serves(200, OVER, OVER).await;
+        let mut sink = Vec::new();
+
+        let written = Operations::at(&address)
+            .backup(&mut sink)
+            .await
+            .expect("a backup is not held to a ceiling it would always exceed");
+
+        assert_eq!(
+            written,
+            u64::try_from(OVER).expect("a test constant fits"),
+            "every declared byte was copied"
+        );
+        assert_eq!(sink.len(), OVER, "and every one of them reached the sink");
+        assert_eq!(
+            sink.get(..16),
+            Some(&b"tessaridb-backup"[..]),
+            "in order, from the first chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backup_is_never_retried_however_many_attempts_are_set() {
+        // C5. The server declares more than it sends, and the numbers are chosen
+        // to straddle a chunk boundary so the failure lands with bytes ALREADY
+        // in the sink — which is the whole hazard. A retry would append a second
+        // copy behind that partial one and report success over a corrupt file,
+        // so the connection count is the assertion: the returned error is
+        // identical either way.
+        let (address, _, connections) = serves(200, 200_000, 100_000).await;
+        let mut sink = Vec::new();
+
+        let failed = Operations::at(&address)
+            .attempts(3)
+            .backup(&mut sink)
+            .await
+            .expect_err("a body that ends early is a truncated answer");
+
+        assert!(
+            matches!(failed, Error::Truncated),
+            "the stream ended inside the body; got {failed:?}"
+        );
+        assert!(
+            !sink.is_empty(),
+            "the partial write is the premise of this test, not an accident — \
+             without it a retry would be harmless and the exemption pointless"
+        );
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "asked exactly once: the first answer is already in the caller's \
+             sink, so a second attempt would append to it"
         );
     }
 
