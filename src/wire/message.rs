@@ -158,6 +158,12 @@ pub enum Answer {
     #[non_exhaustive]
     Records {
         /// What was found — identity as the node spells it, and the value.
+        ///
+        /// The identity is spelled exactly as [`Answer::Keys`] describes: the
+        /// id half alone, in the language's own form, with the quoting that
+        /// separates a text id from an integer one. A record **reference**
+        /// stored inside the value is a different thing and keeps its
+        /// qualified `table:id` form.
         records: Vec<(String, Value)>,
         /// How the node found them: `record`, `index`, `ordered`, or `scan`.
         ///
@@ -190,6 +196,20 @@ pub enum Answer {
         names: Names,
     },
     /// Keys, as the node spells them.
+    ///
+    /// The **id half alone** — there is no `table:` prefix and no colon,
+    /// because the statement that asked already named the table. `KEYS FROM
+    /// notes` over two records answers `["42", "'42'"]`, not `["notes:42", …]`.
+    ///
+    /// Each string is the identity in the **language's own form**, so it can be
+    /// written straight back into a script: `1`, `'ada'`, `uuid '…'`, `0x…`.
+    /// The quoting is load-bearing and is what separates the integer id `42`
+    /// from the text id `'42'`, which are two different records. Do not strip
+    /// it, and do not compare a key against an unquoted string.
+    ///
+    /// This differs from the same outcome over HTTP, where §5.7.1 specifies a
+    /// plain form that collapses those two ids into `"42"` and forbids parsing
+    /// it back. The wire carries the type; the JSON surface does not.
     Keys(Vec<String>),
     /// How many records a conditional delete removed.
     Removed(u64),
