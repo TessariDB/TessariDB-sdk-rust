@@ -1295,3 +1295,104 @@ async fn a_file_with_no_bytes_and_no_file_at_all_have_different_sizes() {
         "a file of no bytes is there and is zero long — not absent"
     );
 }
+
+/// Can this credential reach the fixture bucket on a closed store?
+///
+/// A read of a file that was never written, which is `Ok(None)` when the
+/// credential is accepted and a refusal when it is not. Deliberately a *read*
+/// and not a write: the question is whether the store took the credential, and a
+/// write that succeeded would leave the next assertion looking at a store the
+/// previous one changed.
+async fn reaches(node: &HttpNode, name: &str, password: &str) -> Result<(), u16> {
+    node.operations()
+        .as_user(name, password)
+        .bucket("app", "main", "files")
+        .get("never-written.txt")
+        .await
+        .map(|_| ())
+        .map_err(|error| refusal_status(&error))
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn changing_a_password_retires_the_old_one_and_keeps_the_handle_working() {
+    // C1+C2+C3 against the shipped binary, and the three are asserted together
+    // because no one of them carries the proof. That the call returns `Ok` says
+    // nothing — a method that sent the request and updated nothing returns `Ok`
+    // too, and so does one that updated the handle while the store refused. The
+    // store's own before-and-after answer is the evidence.
+    let node = HttpNode::start_closed(OWNER.0, OWNER.1).await;
+    node.closed_fixture().await;
+
+    let mut handle = node.operations().as_user(OWNER.0, OWNER.1);
+    assert!(
+        reaches(&node, OWNER.0, OWNER.1).await.is_ok(),
+        "the starting credential has to work, or the rest of this proves nothing"
+    );
+
+    handle
+        .change_password("a longer one entirely")
+        .await
+        .expect("the owner should be able to change their own password");
+
+    // C2 — the handle that made the call is still the handle that works. This
+    // is the one that fails silently without `&mut self`: the change lands in
+    // the store and the caller's handle keeps presenting a password the store
+    // no longer holds.
+    //
+    // Asserted through a **credentialed** route on purpose. `metrics()` was the
+    // obvious probe and is the wrong one: the node's `/metrics` handler takes no
+    // credential at all, so it answers a stale handle exactly as happily as a
+    // current one and this assertion would have held with the feature deleted.
+    handle
+        .bucket("app", "main", "files")
+        .get("never-written.txt")
+        .await
+        .expect("the handle must still be usable by the caller who changed it");
+
+    // C3 — and the store really moved, which `Ok` alone never said.
+    assert_eq!(
+        reaches(&node, OWNER.0, OWNER.1).await.unwrap_err(),
+        401,
+        "the old password must stop working, or nothing was changed"
+    );
+    assert!(
+        reaches(&node, OWNER.0, "a longer one entirely")
+            .await
+            .is_ok(),
+        "and the new one must work, or something was changed to nothing useful"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn a_wrong_current_password_changes_nothing_at_all() {
+    // C5. The node re-verifies the current password before it changes anything,
+    // and this pins that it does — a route that took the new password on the
+    // strength of a name alone would pass every other test in this file.
+    let node = HttpNode::start_closed(OWNER.0, OWNER.1).await;
+    node.closed_fixture().await;
+
+    let refused = node
+        .operations()
+        .as_user(OWNER.0, "not the password")
+        .change_password("nor is this")
+        .await
+        .expect_err("a wrong current password must not authorise a change");
+    assert_eq!(
+        refusal_status(&refused),
+        401,
+        "401 — present a credential — rather than 403, which would mean the \
+         credential was right and the grants were not"
+    );
+
+    assert!(
+        reaches(&node, OWNER.0, OWNER.1).await.is_ok(),
+        "the real password must be untouched by a refused change"
+    );
+    assert_eq!(
+        reaches(&node, OWNER.0, "nor is this").await.unwrap_err(),
+        401,
+        "and the password the refused call proposed must never have been set"
+    );
+}

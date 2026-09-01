@@ -114,6 +114,22 @@ pub enum Error {
         /// The node's sentence, unwrapped from the JSON that carried it.
         message: String,
     },
+
+    /// The call needs a credential and this handle holds none.
+    ///
+    /// The only failure here the node never saw, and deliberately so. It is
+    /// raised by
+    /// [`Operations::change_password`](crate::Operations::change_password),
+    /// whose request body **is** the new password: sending it to a route that
+    /// will certainly answer `401` would put a secret on the wire — in the
+    /// clear, since this client terminates no TLS — on an exchange that cannot
+    /// succeed.
+    ///
+    /// So the refusal happens before the socket opens. It is reported as itself
+    /// rather than as a fabricated `401`, because a client inventing an answer
+    /// from a node it never reached is a worse habit than an extra variant.
+    #[error("this handle presents no credential, and that call needs the current one")]
+    NoCredential,
 }
 
 /// Why a value would not decode.

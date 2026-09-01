@@ -64,8 +64,24 @@ use crate::http::reply::Reply;
 #[derive(Clone)]
 pub struct Operations {
     address: String,
-    credential: Option<String>,
+    credential: Option<Credential>,
     attempts: u8,
+}
+
+/// Who this handle signs in as, and the header that says so.
+///
+/// One field rather than two parallel `Option`s. The name is kept because
+/// [`change_password`](Operations::change_password) has to build a *new* header
+/// afterwards and cannot recover the name from the old one — base64 is
+/// reversible, but decoding a credential to reuse half of it is a worse answer
+/// than keeping the half that was never a secret.
+///
+/// Held together so the invariant is structural: there is no state in which a
+/// name exists without the header built from it.
+#[derive(Clone)]
+struct Credential {
+    name: String,
+    header: String,
 }
 
 /// How long to wait between attempts.
@@ -139,6 +155,11 @@ impl Operations {
     /// property holds by construction: the `POST` synonym and the ranged write,
     /// the two calls that would break it, are deliberately not offered.
     ///
+    /// [`change_password`](Self::change_password) is the one exception and is
+    /// exempt rather than covered — a retry there re-sends a credential the
+    /// first attempt may already have invalidated, so it never reaches this
+    /// loop at all.
+    ///
     /// **Anything the node actually said is not retried.** A `401` retried is a
     /// loop and a `403` retried is a longer one, and `Malformed`, `TooLarge` and
     /// `NotThisProtocol` are statements about what did arrive.
@@ -189,8 +210,88 @@ impl Operations {
     /// `403` never is, however many times it is retried.
     #[must_use]
     pub fn as_user(mut self, name: &str, password: &str) -> Self {
-        self.credential = Some(basic::header(name, password));
+        self.credential = Some(Credential {
+            name: name.to_owned(),
+            header: basic::header(name, password),
+        });
         self
+    }
+
+    /// Change this user's own password, and keep the handle usable.
+    ///
+    /// The one call on this surface whose **success invalidates the credential
+    /// that authorised it**. Every other method here leaves the handle as it
+    /// found it; after this one the stored header is a credential for a password
+    /// that no longer exists, and the next call would come back `401` while the
+    /// caller's own reading is that the change worked. Nothing raises an error
+    /// at the moment the handle goes stale, which is why this takes `&mut self`
+    /// and rebuilds the header rather than documenting the trap.
+    ///
+    /// # What the node does with it
+    ///
+    /// Measured, not assumed. The body is the new password as plain text, and
+    /// the node **trims trailing newlines** from it — a password ending in one
+    /// cannot be set through this route, and this client does not pretend
+    /// otherwise by escaping it. The current password is re-verified before the
+    /// change, so a wrong one is refused rather than quietly accepted. On
+    /// success **every token this user held stops working**, which matters to a
+    /// caller holding one and not at all to this handle, which holds none.
+    ///
+    /// # A clone made earlier is not updated
+    ///
+    /// [`bucket`](Self::bucket) clones the handle, so a [`Bucket`] built before
+    /// the change keeps the old credential and starts failing. That follows from
+    /// `Clone` and is stated rather than defended against: a handle that reached
+    /// back into its own clones to correct them would be a larger surprise than
+    /// the one it fixed. Build buckets after the change, or rebuild them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoCredential`] — **before anything is sent** — when this handle
+    /// presents no credential. The body of this request *is* the new password,
+    /// and the route needs a current one, so a handle without a credential would
+    /// be putting a secret on the wire for a request that cannot succeed.
+    ///
+    /// [`Error::HttpRefused`] otherwise: `401` for a wrong current password, and
+    /// note that a token would be refused here too — this route takes Basic
+    /// credentials only, deliberately, because a token is not proof of a
+    /// password. The handle is left untouched on every failure.
+    ///
+    /// # This one call is never retried
+    ///
+    /// [`attempts`](Self::attempts) does not reach it, and the exemption is the
+    /// point rather than an oversight. Retrying is safe on this surface because
+    /// every other method it carries is idempotent; this one is the exception
+    /// the invariant was waiting for. If the first attempt reached the store and
+    /// its answer was lost on the way back, the password has already changed —
+    /// so the second attempt presents a credential the first one invalidated and
+    /// comes back `401`, reporting a failure for a change that succeeded.
+    ///
+    /// A transport error here therefore means *the outcome is unknown*, which is
+    /// the honest answer and is one a caller can act on: try the new password.
+    pub async fn change_password(&mut self, new: &str) -> Result<()> {
+        let Some(held) = self.credential.as_ref() else {
+            return Err(Error::NoCredential);
+        };
+        // Built before the exchange but installed only after it, so a refusal
+        // cannot leave the handle holding a password the store never took.
+        let next = Credential {
+            name: held.name.clone(),
+            header: basic::header(&held.name, new),
+        };
+
+        // `exchange` rather than `send`: one attempt, deliberately, for the
+        // reason given above. This is the only caller on the type that reaches
+        // past the retry loop, and it is the only one that may.
+        let reply = self
+            .exchange("POST", "/password", Some(new.as_bytes()))
+            .await?;
+        if reply.status != 200 {
+            return Err(refusal(&reply));
+        }
+
+        self.credential = Some(next);
+        Ok(())
     }
 
     /// The bucket of this name, in this database, in this namespace.
@@ -321,7 +422,7 @@ impl Operations {
         // decide what to make of, and the answer it gives to that is not one
         // this client has measured.
         let authorization = match &self.credential {
-            Some(value) => format!("Authorization: {value}\r\n"),
+            Some(held) => format!("Authorization: {}\r\n", held.header),
             None => String::new(),
         };
         let request = format!(
@@ -409,10 +510,10 @@ mod tests {
     // to keep panics out of the paths a caller runs.
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    use tokio::io::AsyncWriteExt as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpListener;
 
     use super::Operations;
@@ -459,6 +560,208 @@ mod tests {
         });
 
         (address, seen)
+    }
+
+    /// A listener that answers `status` and keeps every request it was handed,
+    /// headers and body together.
+    ///
+    /// The counting listener above cannot see what was *sent*, and the whole
+    /// claim of [`Operations::change_password`] is about a header changing. A
+    /// test that only checked the returned `Result` would pass on a method that
+    /// updated nothing, which is the failure being guarded against.
+    async fn recorder(status: u16) -> (String, Arc<Mutex<Vec<String>>>) {
+        let socket = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free port for the mock");
+        let address = socket
+            .local_addr()
+            .expect("the mock's own address")
+            .to_string();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&seen);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = socket.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                // One byte at a time, which is slow and exactly right for a
+                // mock: it stops at the end of the body instead of blocking on
+                // a read that will never fill.
+                while stream.read_exact(&mut byte).await.is_ok() {
+                    request.push(byte[0]);
+                    if finished(&request) {
+                        break;
+                    }
+                }
+                kept.lock()
+                    .expect("the mock's record")
+                    .push(String::from_utf8_lossy(&request).into_owned());
+
+                let answer = format!(
+                    "HTTP/1.1 {status} .\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                );
+                let _ = stream.write_all(answer.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        (address, seen)
+    }
+
+    /// Whether a request is complete: headers, then exactly the declared body.
+    fn finished(request: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(request);
+        let Some(head) = text.find("\r\n\r\n") else {
+            return false;
+        };
+        let declared = text
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .and_then(|written| written.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        // Saturating because this crate denies bare arithmetic everywhere,
+        // tests included: a mock that overflowed its way to `true` would report
+        // a complete request where the bytes had not arrived.
+        request.len() >= head.saturating_add(4).saturating_add(declared)
+    }
+
+    /// The header a handle presents, as it appears on the wire.
+    const OLD: &str = "Basic YWRtaW46b2xk";
+    /// The same, after the password below has been changed to `new`.
+    const NEW: &str = "Basic YWRtaW46bmV3";
+
+    #[tokio::test]
+    async fn changing_a_password_without_one_opens_no_connection() {
+        // C4, and the criterion that cannot be checked from the return value:
+        // the refusal looks identical whether or not the new password crossed
+        // the network, so the connection count is the whole assertion. The body
+        // of this request *is* a secret, and this client terminates no TLS.
+        let (address, seen) = listener(0, 200).await;
+        let mut handle = Operations::at(&address);
+
+        let refused = handle
+            .change_password("new")
+            .await
+            .expect_err("a handle with no credential cannot change a password");
+
+        assert!(
+            matches!(refused, Error::NoCredential),
+            "reported as itself, not as a 401 this client invented; got {refused:?}"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0,
+            "nothing may be sent — the body would be the new password, on an \
+             exchange that cannot succeed"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_new_password_is_the_body_and_the_old_credential_signs_for_it() {
+        // C1. Two claims about one request, and both are on the wire rather
+        // than in the return value.
+        let (address, seen) = recorder(200).await;
+        let mut handle = Operations::at(&address).as_user("admin", "old");
+
+        handle
+            .change_password("new")
+            .await
+            .expect("the mock says 200");
+
+        let sent = seen.lock().expect("the mock's record");
+        let request = sent.first().expect("exactly one request was made");
+        assert!(
+            request.starts_with("POST /password HTTP/1.1\r\n"),
+            "the route and method are the node's, not invented; got {request}"
+        );
+        assert!(
+            request.contains(&format!("Authorization: {OLD}\r\n")),
+            "the *current* password authorises the change; got {request}"
+        );
+        assert!(
+            request.ends_with("\r\n\r\nnew"),
+            "the body is the new password with nothing wrapped around it; got \
+             {request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_change_leaves_the_handle_holding_the_new_password() {
+        // C2, the wave's reason for existing. Without this the call succeeds
+        // and every later call on the same handle returns 401, with nothing
+        // anywhere in an error state at the moment the handle went stale.
+        let (address, seen) = recorder(200).await;
+        let mut handle = Operations::at(&address).as_user("admin", "old");
+
+        handle
+            .change_password("new")
+            .await
+            .expect("the mock says 200");
+        let _ = handle.metrics().await;
+
+        let sent = seen.lock().expect("the mock's record");
+        let after = sent.get(1).expect("a second request followed the change");
+        assert!(
+            after.contains(&format!("Authorization: {NEW}\r\n")),
+            "the handle must sign the next call with the password it just set; \
+             got {after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_change_leaves_the_handle_exactly_as_it_was() {
+        // C5. The other half of C2 and the one that would go unnoticed: a
+        // handle that adopted a password the store rejected would fail every
+        // later call, and the failure would name the later call rather than
+        // this one.
+        let (address, seen) = recorder(401).await;
+        let mut handle = Operations::at(&address).as_user("admin", "old");
+
+        let refused = handle
+            .change_password("new")
+            .await
+            .expect_err("the mock refuses");
+        assert!(
+            matches!(refused, Error::HttpRefused { status: 401, .. }),
+            "the node's own answer reaches the caller; got {refused:?}"
+        );
+
+        let _ = handle.metrics().await;
+        let sent = seen.lock().expect("the mock's record");
+        let after = sent.get(1).expect("a second request followed the refusal");
+        assert!(
+            after.contains(&format!("Authorization: {OLD}\r\n")),
+            "a refused change must not be adopted; got {after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_password_change_is_never_retried_however_many_attempts_are_set() {
+        // The exemption, pinned. Routing this call back through `send` would
+        // pass every other test in this file and break only under a truncated
+        // answer, where the second attempt presents the credential the first
+        // one invalidated and a successful change reports 401.
+        let (address, seen) = listener(1, 200).await;
+        let mut handle = Operations::at(&address).as_user("admin", "old").attempts(5);
+
+        let failed = handle
+            .change_password("new")
+            .await
+            .expect_err("the first attempt is hung up on and there is no second");
+
+        assert!(
+            matches!(failed, Error::Truncated | Error::Io(_)),
+            "the transport failure is reported as itself; got {failed:?}"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "exactly one attempt, even with five allowed — the outcome of a lost \
+             answer is unknown, and asking again cannot resolve it"
+        );
     }
 
     #[tokio::test]
