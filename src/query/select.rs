@@ -21,6 +21,41 @@ impl Order {
     }
 }
 
+/// One entry of a projection (contract §4.2).
+///
+/// A bare field name, or a window onto a long text field. It is an enum rather
+/// than two parallel lists because §4.2 renders the items **in the order they
+/// were named**, and two lists cannot express one order.
+#[derive(Debug, Clone)]
+enum Projection {
+    Field(String),
+    Lines {
+        field: String,
+        start: u64,
+        count: u64,
+    },
+}
+
+impl Projection {
+    /// The field this item reads, which is name-checked either way.
+    const fn field(&self) -> &String {
+        match self {
+            Self::Field(name) | Self::Lines { field: name, .. } => name,
+        }
+    }
+
+    fn render(&self) -> String {
+        match self {
+            Self::Field(name) => name.clone(),
+            Self::Lines {
+                field,
+                start,
+                count,
+            } => format!("string::lines({field}, {start}, {count}) AS {field}"),
+        }
+    }
+}
+
 /// A read.
 ///
 /// ```
@@ -40,7 +75,7 @@ impl Order {
 #[derive(Debug, Clone)]
 pub struct Select {
     source: String,
-    projection: Vec<String>,
+    projection: Vec<Projection>,
     filter: Option<Filter>,
     order: Vec<(String, Order)>,
     start: Option<u64>,
@@ -66,7 +101,42 @@ impl Select {
     /// With none named the statement projects everything.
     #[must_use]
     pub fn field(mut self, name: impl Into<String>) -> Self {
-        self.projection.push(name.into());
+        self.projection.push(Projection::Field(name.into()));
+        self
+    }
+
+    /// Return `count` lines of a text field, starting at line `start`.
+    ///
+    /// For reading a long body a piece at a time rather than whole. Lines are
+    /// counted from zero, and two adjacent windows reconstruct the field, so a
+    /// caller pages through a document without ever holding all of it. The
+    /// field comes back under **its own name**, so the mapping that reads it
+    /// does not change with the window.
+    ///
+    /// The two counts are part of the statement's text rather than parameters —
+    /// §4.2's rule for `START` and `LIMIT`, for its reason: they are `u64` from
+    /// the type system, so there is no syntax to smuggle through them.
+    ///
+    /// ```
+    /// use tessaridb_client::query::Select;
+    ///
+    /// let query = Select::from("memories")
+    ///     .field_lines("body", 0, 40)
+    ///     .build()
+    ///     .expect("a well-formed query");
+    ///
+    /// assert_eq!(
+    ///     query.script,
+    ///     "SELECT string::lines(body, 0, 40) AS body FROM memories;"
+    /// );
+    /// ```
+    #[must_use]
+    pub fn field_lines(mut self, name: impl Into<String>, start: u64, count: u64) -> Self {
+        self.projection.push(Projection::Lines {
+            field: name.into(),
+            start,
+            count,
+        });
         self
     }
 
@@ -110,10 +180,14 @@ impl Select {
         let projection = if self.projection.is_empty() {
             "*".to_owned()
         } else {
-            for name in &self.projection {
-                check_name("a field", name)?;
+            for item in &self.projection {
+                check_name("a field", item.field())?;
             }
-            self.projection.join(", ")
+            self.projection
+                .iter()
+                .map(Projection::render)
+                .collect::<Vec<_>>()
+                .join(", ")
         };
 
         let mut script = format!("SELECT {projection} FROM {}", self.source);

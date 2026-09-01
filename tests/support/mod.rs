@@ -327,8 +327,19 @@ pub fn build(json: &Json) -> Result<Query, BuildError> {
         "select" => {
             let mut select = Select::from(held["from"].as_str().expect("a table"));
             if let Some(named) = held.get("fields").and_then(Json::as_array) {
-                for name in named {
-                    select = select.field(name.as_str().expect("a field name"));
+                for item in named {
+                    // §4.2: a projection item is a bare field name or a line
+                    // window. The window carries its own counts, so it cannot
+                    // be a string.
+                    select = if let Some(window) = item.get("lines") {
+                        select.field_lines(
+                            window["field"].as_str().expect("a field name"),
+                            window["start"].as_u64().expect("a start line"),
+                            window["count"].as_u64().expect("a line count"),
+                        )
+                    } else {
+                        select.field(item.as_str().expect("a field name"))
+                    };
                 }
             }
             if let Some(condition) = held.get("where") {

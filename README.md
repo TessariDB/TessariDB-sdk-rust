@@ -190,6 +190,20 @@ let q = Select::from("users")
     .limit(50);
 ```
 
+**A long text field can come back a window at a time** rather than whole:
+
+```rust
+let head = Select::from("documents").field_lines("body", 0, 40);
+let next = Select::from("documents").field_lines("body", 40, 40);
+```
+
+Lines count from zero, two adjacent windows reconstruct the field, and it
+arrives under its own name — so the mapping that reads a `body` does not change
+with the window. The two counts are written into the statement rather than
+bound, which is the same rule `START` and `LIMIT` follow and for the same
+reason: they are the statement's shape rather than data, and they are `u64`, so
+there is no syntax to smuggle through them.
+
 Values bind as parameters *after* the statement is parsed, so a string
 containing `'; DROP TABLE users; --` is text that reads alarmingly and does
 nothing at all. A builder that formatted values into the query would destroy the
