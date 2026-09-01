@@ -440,9 +440,9 @@ const CHANGE_BUDGET: Duration = Duration::from_secs(10);
 /// The next change, or a failure naming the budget it outlived.
 ///
 /// The stream type is spelled out because `Feed<S>` carries no default, unlike
-/// `Client<S = TcpStream>` beside it. Noted as Q-SDK-12 rather than fixed here:
-/// the asymmetry is real and the fix is one word, but it is production API and
-/// this wave's request was evidence for S6 (BGV-SURGICAL-001).
+/// `Client<S = TcpStream>` beside it. Recorded rather than fixed here: the
+/// asymmetry is real and the fix is one word, but it changes published API and
+/// this test was written for something else.
 async fn next_change(feed: &mut Feed<tokio::net::TcpStream>) -> Change {
     match tokio::time::timeout(CHANGE_BUDGET, feed.next()).await {
         Ok(Ok(Some(change))) => change,

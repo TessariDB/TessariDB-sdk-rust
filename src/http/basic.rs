@@ -14,7 +14,7 @@
 //!
 //! Only the encoder is here. Nothing in this client ever reads a base64 value,
 //! so a decoder would be code with no caller, and the first bug in it would be
-//! found by whoever eventually wrote one (BGV-MINIMAL-001).
+//! found by whoever eventually wrote one.
 
 /// RFC 4648 §4, the standard alphabet. Not the URL-safe one: this value goes in
 /// a header, not in a path.
