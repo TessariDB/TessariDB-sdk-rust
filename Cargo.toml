@@ -11,12 +11,21 @@ publish = false
 [dependencies]
 # The runtime is a declared dependency, not an incidental one (ADR-SDK-0003).
 # `io-util` for the read/write halves, `net` for TcpStream, `macros`+`rt` so a
-# caller that has no runtime of its own can still be handed one in tests.
+# caller that has no runtime of its own can still be handed one in tests, and
+# `time` for the pause between retry attempts.
+#
+# `time` was missing here until 2026-09-01 although the retry loop had used
+# `tokio::time::sleep` since it was written, and the whole gate set walked past
+# it: `cargo test` and `cargo clippy --all-targets` both unify the
+# dev-dependency's features into the library build, so both compiled a `tokio`
+# that had `time` for reasons nothing in this section supplied. Only a plain
+# `cargo build` sees the library as a consumer would.
 tokio = { version = "1", default-features = false, features = [
     "io-util",
     "net",
     "rt",
     "macros",
+    "time",
 ] }
 thiserror = "2"
 # Most of the node's HTTP surface answers `application/json`, and its strings

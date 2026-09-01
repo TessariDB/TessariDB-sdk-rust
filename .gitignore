@@ -1,5 +1,9 @@
 # Rust
 /target
+# Clippy gets its own, because check, clippy and test are three compile modes
+# and sharing one directory makes them evict each other's fingerprints — the
+# cost is a full rebuild on every alternation, not a slower one.
+/target-lint
 **/*.rs.bk
 *.pdb
 
