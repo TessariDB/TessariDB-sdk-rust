@@ -40,6 +40,7 @@
 //! As on the wire protocol. A node belongs on a network you protect or behind
 //! something that terminates TLS.
 
+mod basic;
 mod condition;
 mod object;
 mod reply;
@@ -60,9 +61,37 @@ use crate::http::reply::Reply;
 /// independent, so a connection per call costs nothing worth keeping a pool for
 /// — and a pooled connection to a node that restarted is a failure at the next
 /// call rather than at the one that should have had it.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Operations {
     address: String,
+    credential: Option<String>,
+}
+
+/// Written rather than derived, because a derived one prints the credential.
+///
+/// The header is base64, which is a **spelling** of the password and not a
+/// disguise for it — anything that reads the line reads the password. A derived
+/// `Debug` therefore puts a working credential into any log, panic message or
+/// test failure that formats one of these, and into every [`Bucket`] too, since
+/// a bucket holds one of these and derives its own.
+///
+/// So the presence of a credential is reported and its value never is. Presence
+/// is worth reporting: *sent no credential* is the single most likely cause of a
+/// `401` a caller is looking at, and hiding the field entirely would remove the
+/// one thing the output is being read for.
+impl std::fmt::Debug for Operations {
+    fn fmt(&self, form: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        form.debug_struct("Operations")
+            .field("address", &self.address)
+            .field(
+                "credential",
+                match self.credential {
+                    Some(_) => &"<present>",
+                    None => &"<none>",
+                },
+            )
+            .finish()
+    }
 }
 
 impl Operations {
@@ -70,10 +99,42 @@ impl Operations {
     ///
     /// This is the node's **HTTP** address, which is not its wire address: a
     /// node serves them on separate ports and may serve only one.
+    ///
+    /// No credential is sent. That is not a placeholder to be filled in later —
+    /// a store with no user runs anything, and against one of those an absent
+    /// header is the correct request. Add credentials with
+    /// [`as_user`](Self::as_user) when the store has a user.
     pub fn at(address: impl Into<String>) -> Self {
         Self {
             address: address.into(),
+            credential: None,
         }
+    }
+
+    /// Present these credentials on every request this handle makes.
+    ///
+    /// Taken once and held, rather than passed at each call. A credential per
+    /// call is a secret at every call site and one of them eventually goes
+    /// without — and a request that silently omits the header does not fail
+    /// loudly, it comes back `401` on a closed store and `400` on an open one,
+    /// which are two different-looking bugs with one cause.
+    ///
+    /// The header is built here, so the plaintext password stops existing inside
+    /// this crate the moment the handle is made.
+    ///
+    /// # A closed store and an open one refuse differently
+    ///
+    /// Measured against the shipped node: on a **closed** store an
+    /// uncredentialed call is `401` with `WWW-Authenticate`, a wrong password is
+    /// also `401`, and a right credential reaching outside the user's grants is
+    /// `403`. On an **open** store the identical call is `400`. The status
+    /// follows the store's posture rather than the call, which is why `401` and
+    /// `403` are kept apart: a `401` is worth presenting a credential for and a
+    /// `403` never is, however many times it is retried.
+    #[must_use]
+    pub fn as_user(mut self, name: &str, password: &str) -> Self {
+        self.credential = Some(basic::header(name, password));
+        self
     }
 
     /// The bucket of this name, in this database, in this namespace.
@@ -179,8 +240,17 @@ impl Operations {
             Some(bytes) => format!("Content-Length: {}\r\n", bytes.len()),
             None => String::new(),
         };
+        // Absent rather than empty when there is no credential. An
+        // `Authorization:` with nothing after it is a header the node must then
+        // decide what to make of, and the answer it gives to that is not one
+        // this client has measured.
+        let authorization = match &self.credential {
+            Some(value) => format!("Authorization: {value}\r\n"),
+            None => String::new(),
+        };
         let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n{length}\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\
+             {authorization}{length}\r\n",
             self.address
         );
         stream.write_all(request.as_bytes()).await?;
@@ -226,4 +296,67 @@ fn sentence(body: &[u8]) -> String {
         .ok()
         .and_then(|json| json.get("error").and_then(Json::as_str).map(str::to_owned))
         .unwrap_or_else(|| String::from_utf8_lossy(body).trim().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Operations;
+
+    /// The password, and the base64 that is only a spelling of it.
+    ///
+    /// Both are asserted absent: checking for the plaintext alone would pass on
+    /// a `Debug` that printed the header, which is the exact thing being
+    /// prevented — the header is a working credential, decodable by anything.
+    #[test]
+    fn debugging_a_handle_does_not_print_the_credential() {
+        let handle = Operations::at("127.0.0.1:1").as_user("admin", "s3cr3t pw");
+        let shown = format!("{handle:?}");
+
+        assert!(
+            !shown.contains("s3cr3t"),
+            "the plaintext password must not be formatted; got {shown}"
+        );
+        assert!(
+            !shown.contains("YWRtaW46czNjcjN0IHB3"),
+            "nor the header, which decodes back to it; got {shown}"
+        );
+        assert!(
+            shown.contains("<present>"),
+            "that a credential is set is worth saying — it is the first thing \
+             looked for when a 401 arrives; got {shown}"
+        );
+        assert!(
+            shown.contains("127.0.0.1:1"),
+            "the address is not a secret and is the other half of the question; \
+             got {shown}"
+        );
+    }
+
+    /// A bucket derives its `Debug` and holds one of these, so it is the second
+    /// way the credential reaches a log and is worth pinning separately.
+    #[test]
+    fn debugging_a_bucket_does_not_print_the_credential_either() {
+        let bucket = Operations::at("127.0.0.1:1")
+            .as_user("admin", "s3cr3t pw")
+            .bucket("app", "main", "files");
+        let shown = format!("{bucket:?}");
+
+        assert!(
+            !shown.contains("s3cr3t") && !shown.contains("YWRtaW46czNjcjN0IHB3"),
+            "a bucket carries the handle, and formatting it must not carry the \
+             credential out with it; got {shown}"
+        );
+    }
+
+    /// Absence is reported as absence rather than as nothing at all.
+    #[test]
+    fn a_handle_with_no_credential_says_which_it_is() {
+        let shown = format!("{:?}", Operations::at("127.0.0.1:1"));
+        assert!(
+            shown.contains("<none>"),
+            "sending no credential is the most likely cause of a 401, so the \
+             output has to distinguish it from a credential it declined to \
+             print; got {shown}"
+        );
+    }
 }

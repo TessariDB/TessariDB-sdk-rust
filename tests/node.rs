@@ -159,14 +159,21 @@ impl Drop for Node {
     }
 }
 
-/// A namespace, a database and a table, so a record has somewhere to live.
+/// A namespace, a database and a collection, so a record has somewhere to live.
 ///
 /// One connection is one session, so the `USE` statements below are still in
 /// force for every later statement on the same client — which is what makes this
 /// a setup step rather than a prefix every test has to repeat.
+///
+/// `DEFINE COLLECTION` rather than `DEFINE TABLE`: the records these tests write
+/// carry fields nobody declared, and a bare `DEFINE TABLE` is now refused for
+/// exactly that — *"the table users declares no fields, so there is nothing for
+/// it to be strict about"*. The node names two ways out and this is the one that
+/// says what these tests actually mean; `SCHEMALESS` is for a table that does
+/// declare fields and admits others too.
 const PREAMBLE: &str = "DEFINE NAMESPACE app; USE NAMESPACE app; \
                         DEFINE DATABASE main; USE DATABASE main; \
-                        DEFINE TABLE users;";
+                        DEFINE COLLECTION users;";
 
 /// Pull the records out of an answer, or say what arrived instead.
 fn records(answer: &Answer) -> &Vec<(String, Value)> {
@@ -505,7 +512,7 @@ async fn the_table_filter_excludes_a_table_it_was_not_given() {
 
     let mut writer = node.client().await;
     writer
-        .run(&format!("{PREAMBLE} DEFINE TABLE logs;"), None)
+        .run(&format!("{PREAMBLE} DEFINE COLLECTION logs;"), None)
         .await
         .expect("the preamble and the second table should be accepted");
 
@@ -562,7 +569,28 @@ struct HttpNode {
 }
 
 impl HttpNode {
+    /// A node with **no user**, so every route runs for anyone.
     async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    /// A node **closed** by an initial user, so every route needs a credential.
+    ///
+    /// The posture has to be chosen at startup because it is not something a
+    /// running node changes on request — and a credential test against an open
+    /// store passes whether or not the header was ever sent, which is the one
+    /// way this wave could have shipped nothing while reporting four green
+    /// tests.
+    ///
+    /// Both variables or neither: the node refuses to start on half of them, and
+    /// that refusal is worth keeping rather than working around, because a store
+    /// that came up open through a typo looks exactly like one that came up
+    /// right.
+    async fn start_closed(name: &str, password: &str) -> Self {
+        Self::start_with(Some((name, password))).await
+    }
+
+    async fn start_with(closed_as: Option<(&str, &str)>) -> Self {
         let binary = std::env::var("TESSARIDB_BIN").unwrap_or_else(|_| {
             panic!(
                 "TESSARIDB_BIN is not set.\n\
@@ -587,13 +615,20 @@ impl HttpNode {
         drop(http_probe);
         drop(wire_probe);
 
-        let child = Command::new(&binary)
+        let mut command = Command::new(&binary);
+        command
             .arg("--http")
             .arg(&address)
             .arg("--serve")
             .arg(&wire)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some((name, password)) = closed_as {
+            command
+                .env("TESSARIDB_INITIAL_USER", name)
+                .env("TESSARIDB_INITIAL_PASSWORD", password);
+        }
+        let child = command
             .spawn()
             .unwrap_or_else(|e| panic!("could not start {binary}: {e}"));
 
@@ -998,4 +1033,190 @@ async fn deleting_a_file_removes_it_and_deleting_it_again_is_still_fine() {
         .delete("temporary.txt")
         .await
         .expect("deleting a file that is already gone should also succeed");
+}
+
+/// The initial user every closed-store test in this file signs in as.
+///
+/// A space in the password on purpose: it is the one character that would make a
+/// credential survive a naive encoder and fail a correct one, so a header built
+/// by concatenation rather than by base64 dies here rather than in production.
+const OWNER: (&str, &str) = ("root", "s3cr3t pw");
+
+/// A user who exists, whose password is right, and whose reach stops at one
+/// database.
+///
+/// `ROLE owner` deliberately, so the only thing that can refuse this user is the
+/// **scope**. A narrower role would refuse too, and the test would pass while
+/// proving something else.
+const SCOPED: (&str, &str) = ("narrow", "a narrow one");
+
+impl HttpNode {
+    /// Declare the fixture on a **closed** store, over the wire, as the owner.
+    ///
+    /// Separate from [`bucket`](Self::bucket) because the wire half needs the
+    /// credential too: a closed store refuses an anonymous `DEFINE` exactly as
+    /// firmly as it refuses an anonymous read, so a fixture written the open way
+    /// fails before the test it was setting up ever runs.
+    async fn closed_fixture(&self) {
+        let mut client = Client::connect(&self.wire)
+            .await
+            .unwrap_or_else(|e| panic!("could not reach the wire port at {}: {e}", self.wire));
+        // Interpolated from the constant rather than repeated as a literal, so
+        // the user this declares and the user the test signs in as cannot drift
+        // apart. Written into the script text only because both halves are
+        // literals in this file — a credential a *caller* supplies belongs in a
+        // parameter, which is the whole of what `run_with` is for.
+        let script = format!(
+            "DEFINE NAMESPACE app; USE NAMESPACE app; \
+             DEFINE DATABASE main; USE DATABASE main; \
+             DEFINE BUCKET files; \
+             DEFINE USER {} ON app.main ROLE owner PASSWORD '{}';",
+            SCOPED.0, SCOPED.1
+        );
+        client
+            .run(&script, Some(OWNER))
+            .await
+            .expect("the owner of a closed store should be able to declare the fixture");
+    }
+}
+
+/// The status a refusal carries, or a panic naming what arrived instead.
+fn refusal_status(error: &Error) -> u16 {
+    match error {
+        Error::HttpRefused { status, .. } => *status,
+        other => panic!("expected an HTTP refusal carrying a status; got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn a_closed_store_refuses_a_call_that_carries_no_credential() {
+    // D2. The test has to run against a **closed** store, and that is the whole
+    // design of this wave rather than a detail of it: on an open store every
+    // call succeeds whether or not the header was sent, so a credential suite
+    // written there passes with the feature deleted.
+    let node = HttpNode::start_closed(OWNER.0, OWNER.1).await;
+    node.closed_fixture().await;
+
+    let anonymous = node.operations().bucket("app", "main", "files");
+    let refused = anonymous
+        .get("greeting.txt")
+        .await
+        .expect_err("a closed store must not answer an uncredentialed read");
+
+    assert_eq!(
+        refusal_status(&refused),
+        401,
+        "an absent credential is 401 — the status that means *present one*"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn the_same_call_with_the_right_credential_is_answered() {
+    // D3, and the falsification for D2: if the header were never sent, this test
+    // would fail with the 401 the previous one asserts. The two are a pair, and
+    // neither alone shows that anything was transmitted.
+    let node = HttpNode::start_closed(OWNER.0, OWNER.1).await;
+    node.closed_fixture().await;
+
+    let bucket = node
+        .operations()
+        .as_user(OWNER.0, OWNER.1)
+        .bucket("app", "main", "files");
+
+    bucket
+        .put("greeting.txt", b"hello, closed store")
+        .await
+        .expect("the owner should be able to write");
+    assert_eq!(
+        bucket.get("greeting.txt").await.expect("and to read back"),
+        Some(b"hello, closed store".to_vec()),
+        "the bytes must survive the round trip through the credentialed path"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn a_wrong_password_and_a_scope_that_does_not_reach_are_told_apart() {
+    // D4. The protocol says a client branches on the code, and these two are the
+    // reason it matters: 401 is worth presenting a credential for, and 403 never
+    // is — retrying it with a better password is a loop, not a recovery.
+    let node = HttpNode::start_closed(OWNER.0, OWNER.1).await;
+    node.closed_fixture().await;
+
+    let wrong = node
+        .operations()
+        .as_user(OWNER.0, "not the password")
+        .bucket("app", "main", "files")
+        .get("greeting.txt")
+        .await
+        .expect_err("a wrong password must not be answered");
+    assert_eq!(
+        refusal_status(&wrong),
+        401,
+        "a wrong password is the same status as no password: the node does not \
+         say which of the two it was, and a client must not invent the difference"
+    );
+
+    // The same user, the same right password, reaching a database their grant
+    // does not cover. Declared `ROLE owner` so the scope is the only thing left
+    // that can refuse.
+    let outside = node
+        .operations()
+        .as_user(SCOPED.0, SCOPED.1)
+        .bucket("other", "main", "files")
+        .get("greeting.txt")
+        .await
+        .expect_err("a user must not reach outside their own namespace");
+    assert_eq!(
+        refusal_status(&outside),
+        403,
+        "reaching outside a grant is 403 — a credential was accepted and is \
+         still not enough, which is a different thing from not having one"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn the_refusal_status_follows_the_stores_posture_and_not_the_call() {
+    // The measurement that makes the three tests above mandatory rather than
+    // merely thorough. One call, named identically both times, answered with two
+    // different statuses depending on something the caller cannot see from the
+    // call site.
+    //
+    // On an **open** store the node looks the namespace up and reports that it
+    // is not there. On a **closed** one it never gets that far: the credential
+    // is checked first, so the same request is refused before the namespace is
+    // ever a question. A suite written against an open store therefore pins the
+    // wrong number and keeps passing after authentication stops working.
+    let open = HttpNode::start().await;
+    let on_open = open
+        .operations()
+        .bucket("nowhere", "main", "files")
+        .get("greeting.txt")
+        .await
+        .expect_err("a namespace that does not exist must not be answered");
+
+    let closed = HttpNode::start_closed(OWNER.0, OWNER.1).await;
+    let on_closed = closed
+        .operations()
+        .bucket("nowhere", "main", "files")
+        .get("greeting.txt")
+        .await
+        .expect_err("a closed store must not answer an uncredentialed read");
+
+    assert_ne!(
+        refusal_status(&on_open),
+        refusal_status(&on_closed),
+        "the identical call must be refused differently on the two postures; \
+         open answered {} and closed answered {}",
+        refusal_status(&on_open),
+        refusal_status(&on_closed)
+    );
+    assert_eq!(
+        refusal_status(&on_closed),
+        401,
+        "the closed store refuses on the credential, before the lookup"
+    );
 }
