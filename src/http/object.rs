@@ -92,6 +92,40 @@ impl Bucket {
         }
     }
 
+    /// How many bytes this file holds, or that there is none — without
+    /// transferring it.
+    ///
+    /// `None` means the node answered `404`, exactly as in [`get`](Self::get),
+    /// and it is not the same as a file that is there and empty: that answers
+    /// `Some(0)`. Collapsing the two would throw the distinction away at the one
+    /// call where a caller is most likely to be asking about it.
+    ///
+    /// # It saves the bytes on the wire, and nothing else
+    ///
+    /// This is a `HEAD`, and the node routes `HEAD` and `GET` to the **same**
+    /// handler: it runs the same read, materialises the whole file, and drops the
+    /// body when it answers. So a `HEAD` on a large file costs the node what a
+    /// `GET` costs it, and only the caller's network is spared.
+    ///
+    /// Worth knowing before this goes in a loop. If a size is wanted for every
+    /// file in a bucket, this is the wrong shape and the right one is a query.
+    ///
+    /// # Errors
+    ///
+    /// As [`put`](Self::put). A `404` is not among them. A `200` carrying no
+    /// declared length is [`Error::Malformed`](crate::Error::Malformed) rather
+    /// than `None`: the node has always declared one, and answering `None` there
+    /// would make a file that exists indistinguishable from one that does not,
+    /// with nothing at the call site able to tell.
+    pub async fn size(&self, path: &str) -> Result<Option<u64>> {
+        let reply = self.node.send("HEAD", &self.route(path), None).await?;
+        match reply.status {
+            200 => reply.length.map(Some).ok_or(crate::Error::Malformed),
+            404 => Ok(None),
+            _ => Err(super::refusal(&reply)),
+        }
+    }
+
     /// Remove this file.
     ///
     /// **Idempotent.** Deleting a file that is not there succeeds, because the

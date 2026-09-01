@@ -1220,3 +1220,78 @@ async fn the_refusal_status_follows_the_stores_posture_and_not_the_call() {
         "the closed store refuses on the credential, before the lookup"
     );
 }
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn a_files_size_comes_back_without_the_file() {
+    // E1 and E3. Three lengths, chosen for where a length answer goes wrong: a
+    // file of no bytes, a file of one, and one large enough that a client
+    // reading the body instead of the header would be doing visibly different
+    // work.
+    //
+    // E3 rides along and is the property that actually breaks. A `HEAD` answers
+    // the `Content-Length` a `GET` would carry and then sends **nothing**, so
+    // every assertion below is reached only because the reader takes
+    // `expects_body` from the method rather than from the header.
+    //
+    // Falsified 2026-09-01 by forcing that argument true: both tests here fail
+    // in milliseconds with `Error::Truncated` — *not* with the hang the design
+    // note predicted. `Connection: close` is why; the node shuts the socket
+    // after the headers, so the read ends rather than blocks. The prediction was
+    // wrong in the client's favour and is corrected at `http/mod.rs::send`.
+    let node = HttpNode::start().await;
+    let bucket = node.bucket().await;
+
+    let large = vec![b'x'; 8192];
+    for (name, bytes) in [
+        ("empty.bin", [].as_slice()),
+        ("one.bin", b"!".as_slice()),
+        ("large.bin", large.as_slice()),
+    ] {
+        bucket
+            .put(name, bytes)
+            .await
+            .unwrap_or_else(|e| panic!("{name} should be written: {e}"));
+        assert_eq!(
+            bucket
+                .size(name)
+                .await
+                .unwrap_or_else(|e| panic!("{name} should have a size: {e}")),
+            Some(bytes.len() as u64),
+            "the declared length must be the file's own, for {name}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn a_file_with_no_bytes_and_no_file_at_all_have_different_sizes() {
+    // E2. `get` already draws this distinction and a length-based answer is
+    // exactly where it would be lost: zero is a plausible-looking stand-in for
+    // "not there", and a caller who took it would delete or skip a file that
+    // exists.
+    let node = HttpNode::start().await;
+    let bucket = node.bucket().await;
+
+    assert_eq!(
+        bucket
+            .size("never-written.bin")
+            .await
+            .expect("asking is fine"),
+        None,
+        "a file that was never written has no size, and says so"
+    );
+
+    bucket
+        .put("written-empty.bin", b"")
+        .await
+        .expect("an empty file should be writable");
+    assert_eq!(
+        bucket
+            .size("written-empty.bin")
+            .await
+            .expect("and should have a size"),
+        Some(0),
+        "a file of no bytes is there and is zero long — not absent"
+    );
+}

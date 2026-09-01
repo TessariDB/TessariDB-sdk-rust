@@ -262,7 +262,19 @@ impl Operations {
         let mut reader = BufReader::new(stream);
         // `expects_body` is the method's property, not the response's: a HEAD
         // answers with the `Content-Length` a GET would carry and sends nothing
-        // after the headers, so a reader that trusts the header waits forever.
+        // after the headers, so a reader that trusts the header is reading bytes
+        // that are never coming.
+        //
+        // **Measured, 2026-09-01**, because this comment used to say "waits
+        // forever" and that is not what happens here: forcing this argument to
+        // `true` fails in milliseconds with `Error::Truncated`, not in a hang.
+        // The reason is `Connection: close` above — the node shuts the socket
+        // after the headers, so `read_exact` hits the end of the stream instead
+        // of blocking on it. The hang is real on a keep-alive connection and
+        // this client has none, which is worth saying plainly rather than
+        // leaving a scarier and wrong claim in place: the next person to weigh
+        // connection reuse should know the failure gets *worse*, not that it is
+        // already the worst.
         reply::read(&mut reader, method != "HEAD").await
     }
 }

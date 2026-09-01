@@ -26,6 +26,19 @@ pub struct Reply {
     pub status: u16,
     /// The body, which is empty when the response carries none.
     pub body: Vec<u8>,
+    /// The length the node **declared**, kept even where no body followed it.
+    ///
+    /// On a `GET` this is the same number as `body.len()` and nothing reads it.
+    /// On a `HEAD` it is the only thing the exchange carries — the node answers
+    /// the length the equivalent `GET` would have sent and then sends nothing —
+    /// so discarding it here, as this reader used to, threw away the entire
+    /// point of the request.
+    ///
+    /// `None` where the node declared none, which this build has never seen: it
+    /// is kept as a distinct state rather than defaulted to zero, because a file
+    /// of unknown size and a file of no bytes are different answers and only one
+    /// of them is true.
+    pub length: Option<u64>,
 }
 
 /// Read one response off the stream.
@@ -64,9 +77,11 @@ where
         return Ok(Reply {
             status,
             body: Vec::new(),
+            length,
         });
     }
 
+    let declared = length;
     let length = length.ok_or(Error::Malformed)?;
     if length > BODY_CEILING {
         return Err(Error::TooLarge {
@@ -80,7 +95,11 @@ where
         .read_exact(&mut body)
         .await
         .map_err(|_| Error::Truncated)?;
-    Ok(Reply { status, body })
+    Ok(Reply {
+        status,
+        body,
+        length: declared,
+    })
 }
 
 /// Read `HTTP/1.1 <code> <reason>` and keep the code.
