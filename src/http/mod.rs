@@ -65,7 +65,16 @@ use crate::http::reply::Reply;
 pub struct Operations {
     address: String,
     credential: Option<String>,
+    attempts: u8,
 }
+
+/// How long to wait between attempts.
+///
+/// Fixed rather than a curve. Three attempts fired in microseconds at a node
+/// that is restarting are three failures rather than one, so *some* pause is
+/// what makes retrying mean anything; a configurable backoff is flexibility
+/// nobody asked for. The number is here so it can be found.
+const PAUSE_BETWEEN_ATTEMPTS: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Written rather than derived, because a derived one prints the credential.
 ///
@@ -90,6 +99,10 @@ impl std::fmt::Debug for Operations {
                     None => &"<none>",
                 },
             )
+            // Not a secret, and the second thing looked for when a call behaved
+            // unexpectedly — a request that took four times as long as expected
+            // is explained by this number and by nothing else visible.
+            .field("attempts", &self.attempts)
             .finish()
     }
 }
@@ -108,7 +121,50 @@ impl Operations {
         Self {
             address: address.into(),
             credential: None,
+            attempts: 1,
         }
+    }
+
+    /// Try a failed request up to `attempts` times in total.
+    ///
+    /// The default is **1** — nothing is retried unless it is asked for.
+    ///
+    /// # What is retried, and why only that
+    ///
+    /// Only [`Error::Io`] and [`Error::Truncated`]: the exchange did not
+    /// complete, and re-asking is safe. Every method this type sends is
+    /// **idempotent** — `GET` and `HEAD` read, `PUT` replaces a file's whole
+    /// content, `DELETE` answers `204` whether or not the file was there — so
+    /// asking twice cannot mean something different from asking once. That
+    /// property holds by construction: the `POST` synonym and the ranged write,
+    /// the two calls that would break it, are deliberately not offered.
+    ///
+    /// **Anything the node actually said is not retried.** A `401` retried is a
+    /// loop and a `403` retried is a longer one, and `Malformed`, `TooLarge` and
+    /// `NotThisProtocol` are statements about what did arrive.
+    ///
+    /// There is a fixed pause of 50ms between attempts.
+    ///
+    /// # Why it is off by default
+    ///
+    /// A silent retry hides a failing node from a caller who wanted to know
+    /// quickly, and multiplies against one who has their own loop. The argument
+    /// the other way is real — this surface's idempotency is provable, so the
+    /// client *could* decide safely — and turning it on later is a change in
+    /// behaviour rather than in API, which is the direction that stays open.
+    ///
+    /// **This does not apply to the wire client**, and cannot. One connection is
+    /// one session there, so a reconnect repeats the request in a session where
+    /// no `USE` has run — targeting the node's default database rather than the
+    /// caller's, which is a wrong answer rather than an error.
+    #[must_use]
+    pub const fn attempts(mut self, attempts: u8) -> Self {
+        // Zero would mean never asking at all, which is not a thing a caller can
+        // want from a request they made. Clamped rather than refused: an
+        // `Option`-returning builder for a value that has an obvious right
+        // reading is ceremony.
+        self.attempts = if attempts == 0 { 1 } else { attempts };
+        self
     }
 
     /// Present these credentials on every request this handle makes.
@@ -229,6 +285,26 @@ impl Operations {
     /// as `Some(&[])`: an empty file is written by declaring a length of zero,
     /// and a request with no `Content-Length` at all is a different request.
     async fn send(&self, method: &str, path: &str, body: Option<&[u8]>) -> Result<Reply> {
+        let mut made = 1_u8;
+        loop {
+            let outcome = self.exchange(method, path, body).await;
+            match &outcome {
+                Err(failure) if retryable(failure) && made < self.attempts => {
+                    made = made.saturating_add(1);
+                    tokio::time::sleep(PAUSE_BETWEEN_ATTEMPTS).await;
+                }
+                _ => return outcome,
+            }
+        }
+    }
+
+    /// One connection, one request, one response — the attempt itself.
+    ///
+    /// Split from [`send`](Self::send) so that the retry decision is made in one
+    /// place over a whole exchange. A retry woven into the steps below would have
+    /// to decide what a half-written request means, and the answer is that this
+    /// connection is finished either way.
+    async fn exchange(&self, method: &str, path: &str, body: Option<&[u8]>) -> Result<Reply> {
         let mut stream = TcpStream::connect(&self.address).await?;
         stream.set_nodelay(true)?;
 
@@ -279,6 +355,23 @@ impl Operations {
     }
 }
 
+/// Whether a failure means the exchange did not complete.
+///
+/// The two cases are *the socket failed* and *the stream ended inside the
+/// answer*, and they are one thing from a caller's side: nothing usable came
+/// back, and on an idempotent request asking again is safe. A connection dropped
+/// mid-answer is indistinguishable from one dropped before it, which is why
+/// `Truncated` is here — and a node genuinely breaking its framing exhausts the
+/// attempts and reports it anyway.
+///
+/// Everything else is excluded because it is something that **did** arrive:
+/// `HttpRefused` is the node's own answer at a status, and `Malformed`,
+/// `TooLarge` and `NotThisProtocol` are judgements about bytes that were
+/// received. Repeating the request cannot change any of them.
+const fn retryable(failure: &Error) -> bool {
+    matches!(failure, Error::Io(_) | Error::Truncated)
+}
+
 /// The node said no, over HTTP, with a status.
 ///
 /// The status is carried as a field rather than folded into the sentence. The
@@ -312,7 +405,164 @@ fn sentence(body: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    // A test is the one place a panic is the correct outcome; these lints exist
+    // to keep panics out of the paths a caller runs.
+    #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::io::AsyncWriteExt as _;
+    use tokio::net::TcpListener;
+
     use super::Operations;
+    use crate::error::Error;
+
+    /// A listener that hangs up on its first `hangups` connections and then
+    /// answers `status` — counting every connection it accepts.
+    ///
+    /// The count is the point. An assertion on the *answer* passes whether the
+    /// client asked once or five times, so a retry loop that retried refusals
+    /// too would look identical from outside. Counting connections is the only
+    /// observation that can tell them apart.
+    async fn listener(hangups: usize, status: u16) -> (String, Arc<AtomicUsize>) {
+        let socket = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free port for the mock");
+        let address = socket
+            .local_addr()
+            .expect("the mock's own address")
+            .to_string();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&seen);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = socket.accept().await else {
+                    return;
+                };
+                let so_far = counted.fetch_add(1, Ordering::SeqCst);
+                if so_far < hangups {
+                    // Dropped without answering: the client sees the stream end
+                    // where a status line should be.
+                    drop(stream);
+                    continue;
+                }
+                let body = "ok";
+                let answer = format!(
+                    "HTTP/1.1 {status} .\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(answer.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        (address, seen)
+    }
+
+    #[tokio::test]
+    async fn a_transport_failure_that_heals_is_survived() {
+        // F1. The first connection is hung up on; the second is answered.
+        let (address, seen) = listener(1, 200).await;
+
+        let answered = Operations::at(&address)
+            .attempts(3)
+            .metrics()
+            .await
+            .expect("the second attempt should be answered");
+
+        assert_eq!(answered, "ok");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            2,
+            "one failed attempt and one that worked — no more and no fewer"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_does_not_retry() {
+        // F2. The same listener, the same failure, and no second attempt —
+        // because retrying is something a caller asks for.
+        let (address, seen) = listener(1, 200).await;
+
+        let refused = Operations::at(&address)
+            .metrics()
+            .await
+            .expect_err("a hung-up connection with one attempt must not succeed");
+
+        assert!(
+            matches!(refused, Error::Truncated | Error::Io(_)),
+            "the failure must be the transport's, not something invented; got {refused:?}"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "the default is one attempt, so exactly one connection is made"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_answered_once_however_many_attempts_are_allowed() {
+        // F3, and the criterion most able to pass vacuously. A 401 comes back
+        // either way; only the connection count shows whether the client
+        // hammered the node with a credential it already knows is wrong.
+        let (address, seen) = listener(0, 401).await;
+
+        let refused = Operations::at(&address)
+            .attempts(5)
+            .metrics()
+            .await
+            .expect_err("a 401 is a refusal, not a success");
+
+        assert!(
+            matches!(refused, Error::HttpRefused { status: 401, .. }),
+            "the node's own answer must survive the retry layer; got {refused:?}"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "a refusal is the node answering, so asking again is a loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn attempts_are_bounded() {
+        // F4. A listener that never answers, and a client that gives up after
+        // exactly the number it was given.
+        let (address, seen) = listener(usize::MAX, 200).await;
+
+        let gave_up = Operations::at(&address)
+            .attempts(2)
+            .metrics()
+            .await
+            .expect_err("nothing ever answers, so this must fail");
+
+        assert!(
+            matches!(gave_up, Error::Truncated | Error::Io(_)),
+            "the last failure is reported as itself; got {gave_up:?}"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            2,
+            "two attempts were allowed, so two connections were made"
+        );
+    }
+
+    #[tokio::test]
+    async fn asking_for_no_attempts_still_asks_once() {
+        // A request nobody sends is not something a caller can want. Clamped
+        // rather than refused, and pinned so the clamp is not quietly dropped.
+        let (address, seen) = listener(0, 200).await;
+
+        Operations::at(&address)
+            .attempts(0)
+            .metrics()
+            .await
+            .expect("zero attempts must still mean one");
+
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
 
     /// The password, and the base64 that is only a spelling of it.
     ///
