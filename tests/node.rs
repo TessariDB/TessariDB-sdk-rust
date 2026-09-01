@@ -45,13 +45,18 @@
     clippy::indexing_slicing
 )]
 
+mod support;
+
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use tessaridb_client::query::{Order, Select, field as on_field};
 use tessaridb_client::{
     Answer, Became, Bucket, Change, Client, Condition, Error, Feed, Follow, FromRecord,
     MappingFault, Number, Operations, Row, Value,
 };
+
+use crate::support::{build, expected_parameters, read_corpus};
 
 /// How long a node gets to bind its port before the test gives up.
 ///
@@ -1480,4 +1485,203 @@ async fn a_refused_backup_leaves_the_callers_sink_untouched() {
         "the refusal body must not reach the sink; got {} bytes",
         sink.len()
     );
+}
+
+// --- the query corpus, against the parser it was written for ------------------
+//
+// `query_corpus.rs` proves this client renders what the contract says. It cannot
+// prove the node accepts it, and nothing offline can: a rendering the parser
+// stopped taking would keep that suite green all the way to a user.
+//
+// So the corpus runs here as well, and this is the half that reaches the parser.
+
+/// Every table a non-refused corpus case reads or writes.
+///
+/// Derived from the corpus rather than hard-coded, so a case naming a new table
+/// fails on a missing collection instead of being quietly skipped.
+fn corpus_tables(cases: &[serde_json::Value]) -> Vec<String> {
+    let mut named: Vec<String> = Vec::new();
+    for case in cases {
+        if case.get("refused").is_some() {
+            continue;
+        }
+        let build = case["build"].as_object().expect("a build is an object");
+        let (_, held) = build.iter().next().expect("one entry");
+        let table = held
+            .get("from")
+            .or_else(|| held.get("table"))
+            .and_then(serde_json::Value::as_str)
+            .expect("every statement names a table");
+        if !named.iter().any(|held| held == table) {
+            named.push(table.to_owned());
+        }
+    }
+    named
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn every_corpus_query_is_accepted_and_run_by_a_real_node() {
+    let node = Node::start().await;
+    let mut client = node.client().await;
+
+    let document = read_corpus("queries-v1.json");
+    let cases = document["cases"].as_array().expect("the corpus has cases");
+    let tables = corpus_tables(cases);
+
+    client
+        .run("DEFINE NAMESPACE corpus; USE NAMESPACE corpus;", None)
+        .await
+        .expect("the namespace should be accepted");
+
+    let mut ran = 0_usize;
+    for (index, case) in cases.iter().enumerate() {
+        if case.get("refused").is_some() {
+            // A refusal never becomes text, so there is nothing to send. The
+            // offline suite is where those are checked.
+            continue;
+        }
+        let name = case["name"].as_str().expect("every case is named");
+
+        // A fresh database per case: several cases write the same identity, and
+        // ordering them so that they happen not to collide would make this suite
+        // depend on the order the corpus lists them in.
+        let collections = tables
+            .iter()
+            .map(|table| format!("DEFINE COLLECTION {table};"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        client
+            .run(
+                &format!("DEFINE DATABASE d{index}; USE DATABASE d{index}; {collections}"),
+                None,
+            )
+            .await
+            .unwrap_or_else(|why| panic!("case {name}: the setup was refused: {why}"));
+
+        // Prerequisites first: an UPDATE needs the record it changes, and a
+        // corpus that left that implicit would work only in the order it happens
+        // to list its cases.
+        for prerequisite in case
+            .get("needs")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or(&Vec::new())
+        {
+            let first = build(&prerequisite["build"])
+                .unwrap_or_else(|why| panic!("case {name}: a prerequisite would not build: {why}"));
+            client
+                .run_with(&first.script, None, first.parameters)
+                .await
+                .unwrap_or_else(|why| {
+                    panic!(
+                        "case {name}: a prerequisite was refused: {}\n{why}",
+                        first.script
+                    )
+                });
+        }
+
+        // Built here rather than taken from the corpus's `script` field: what
+        // needs proving is that *this client's* rendering is accepted, and
+        // sending the corpus's own text would prove it about the corpus.
+        let query = build(&case["build"])
+            .unwrap_or_else(|why| panic!("case {name}: this builder refused a stated case: {why}"));
+        assert_eq!(
+            query.parameters,
+            expected_parameters(&case["parameters"]),
+            "case {name}: parameters differ from the corpus"
+        );
+
+        client
+            .run_with(&query.script, None, query.parameters)
+            .await
+            .unwrap_or_else(|why| {
+                panic!(
+                    "case {name}: the node refused a statement this builder \
+                     rendered.\n  {}\n{why}",
+                    query.script
+                )
+            });
+
+        ran = ran.saturating_add(1);
+    }
+
+    assert!(
+        ran >= 15,
+        "only {ran} cases reached the node — a corpus that shrank to nothing \
+         would pass this suite silently"
+    );
+    println!("corpus against a node: {ran} statements accepted and run");
+}
+
+#[tokio::test]
+#[ignore = "needs the shipped binary; run with --ignored and TESSARIDB_BIN set"]
+async fn the_comparisons_a_parser_cannot_check_are_checked_by_running_them() {
+    // Acceptance is not meaning. A builder that spelled `lt` as `>` would render
+    // text the parser takes, the node would run it, and every record would come
+    // back on the wrong side of the comparison with nothing in an error state.
+    //
+    // Six operators, one seeded collection, and the answer asserted per operator
+    // — this is the only assertion in the crate that would notice.
+    let node = Node::start().await;
+    let mut client = node.client().await;
+
+    client
+        .run(
+            "DEFINE NAMESPACE meaning; USE NAMESPACE meaning; \
+             DEFINE DATABASE main; USE DATABASE main; DEFINE COLLECTION weights; \
+             CREATE weights:1 = { weight: 1 }; CREATE weights:2 = { weight: 2 }; \
+             CREATE weights:3 = { weight: 3 }; CREATE weights:4 = { weight: 4 }; \
+             CREATE weights:5 = { weight: 5 };",
+            None,
+        )
+        .await
+        .expect("the seed should be accepted");
+
+    // Each row: the builder call, and the identities that must come back.
+    let expectations: Vec<(&str, Vec<&str>)> = vec![
+        ("eq", vec!["3"]),
+        ("ne", vec!["1", "2", "4", "5"]),
+        ("lt", vec!["1", "2"]),
+        ("le", vec!["1", "2", "3"]),
+        ("gt", vec!["4", "5"]),
+        ("ge", vec!["3", "4", "5"]),
+    ];
+
+    for (operator, expected) in expectations {
+        let condition = on_field("weight");
+        let condition = match operator {
+            "eq" => condition.eq(3_i64),
+            "ne" => condition.ne(3_i64),
+            "lt" => condition.lt(3_i64),
+            "le" => condition.le(3_i64),
+            "gt" => condition.gt(3_i64),
+            "ge" => condition.ge(3_i64),
+            other => panic!("no such operator: {other}"),
+        };
+        let query = Select::from("weights")
+            .filter(condition)
+            .order_by("weight", Order::Ascending)
+            .build()
+            .expect("a well-formed query");
+
+        let answers = client
+            .run_with(&query.script, None, query.parameters)
+            .await
+            .unwrap_or_else(|why| panic!("{operator}: {} was refused: {why}", query.script));
+
+        let mut found: Vec<&str> = records(&answers[0])
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect();
+        found.sort_unstable();
+
+        assert_eq!(
+            found, expected,
+            "{operator}: `{}` selected the wrong records — the text parsed and \
+             meant something else",
+            query.script
+        );
+    }
+
+    println!("comparison semantics: six operators, each answer asserted");
 }

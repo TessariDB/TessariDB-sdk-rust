@@ -4,6 +4,11 @@
 # and sharing one directory makes them evict each other's fingerprints — the
 # cost is a full rebuild on every alternation, not a slower one.
 /target-lint
+# Same reason, for the same three modes: a per-package run and the editor's
+# analyser each get their own. Listed because one of them was not, and 2895
+# build artifacts reached a commit before `git status` was read carefully.
+/target-pkg
+/target-ra
 **/*.rs.bk
 *.pdb
 

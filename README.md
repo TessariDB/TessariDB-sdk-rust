@@ -196,7 +196,28 @@ nothing at all. A builder that formatted values into the query would destroy the
 one property this store's whole surface is designed around — and would do it
 invisibly, because the output still looks correct.
 
-An incomplete query does not compile: a `Select` with no source has no `build`.
+**An incomplete query is caught, and where it is caught differs by what is
+missing.** A source is taken by the constructor — `Select::from(table)` is the
+only way to have a `Select` at all — so a read with nowhere to read from cannot
+be written down. Fields are not: a `Create` or an `Update` with none is refused
+by `build`, at run time, with a named error rather than a statement the node
+would reject instead.
+
+*(An earlier form of this paragraph claimed a `Select` with no source has no
+`build`. That was true of an earlier builder in another repository and has never
+been true here; corrected 2026-09-01.)*
+
+### What proves the builder is not a second dialect
+
+The rendering is fixed by a shared corpus rather than by this crate's opinion:
+[`spec/query-builder-v1.md`][contract] states what a builder must render, and
+`conformance/queries-v1.json` says it case by case. `cargo test` checks this
+builder against it, and `cargo test --test node -- --ignored` additionally
+**executes** every case against a running node — the only check that reaches the
+parser, and the reason a builder in Python or Go will render exactly what this
+one does.
+
+[contract]: https://github.com/TessariDB/TessariDB-protocol/blob/main/spec/query-builder-v1.md
 
 ## Branches
 
