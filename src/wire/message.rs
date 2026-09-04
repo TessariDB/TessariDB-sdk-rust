@@ -124,6 +124,28 @@ mod tag {
     pub(super) const REMOVED: u8 = 4;
 }
 
+/// What a node said about whether its answer is exact.
+///
+/// Two states, because the third — a node that never sent the field — lives one
+/// level up as the `Option` wrapping this. Keeping them apart is the whole reason
+/// this is not a `bool`: a caller holding `Option<bool>` writes `unwrap_or(true)`
+/// sooner or later, and the value invented there is a promise nobody sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Exact {
+    /// The node called the answer provably the records the question names.
+    Yes,
+    /// It did not, and said why.
+    No {
+        /// The reason, in the node's own words.
+        ///
+        /// Carried rather than derived from the access path on this side: a
+        /// client that phrased it itself would be describing a read it did not
+        /// perform, and would keep describing it that way after the node's own
+        /// wording changed.
+        reason: String,
+    },
+}
+
 /// Something a read volunteered about how it answered.
 ///
 /// A **kind and a message**, not a structure. A client's two uses are to group
@@ -187,6 +209,21 @@ pub enum Answer {
         /// flag is conforming, and produces a one-element array with nothing to
         /// say it was asked for differently.
         only: bool,
+        /// Whether the node called this answer provably the records the
+        /// question names — and `None` when it did not say.
+        ///
+        /// The one field of this variant where absence is **not** the default.
+        /// `notes` above states the opposite rule explicitly: an empty list and
+        /// a node that predates notes are the same claim, so they are not
+        /// distinguished. Here they are different claims. A node older than this
+        /// field made no statement about exactness, and `None` is that — not
+        /// `Some(Exact::Yes)`.
+        ///
+        /// A caller that cannot represent the third state should surface such an
+        /// answer as unverified rather than as exact. An approximate answer and
+        /// an exact one are otherwise the same shape, the same length, and
+        /// frequently the same records.
+        exact: Option<Exact>,
     },
     /// One value, and the names of the tables it references.
     Value {
@@ -288,12 +325,33 @@ fn decode_one(reader: &mut Body<'_>) -> Result<Answer> {
                 Vec::new()
             };
             let only = reader.remaining() > 0 && reader.take_u8()? != 0;
+            // And here the rule above stops applying, which is why this field is
+            // an `Option` where `only` is a `bool`. For every other appended
+            // field, absent means the node had nothing to add — a node that
+            // never heard of `ONLY` served reads that were not `ONLY` reads, so
+            // `false` is the truth about them. Absent exactness is not like
+            // that: such a node did not serve exact answers and forget to say
+            // so, it made no claim at all, and reading the silence as `Yes`
+            // would put a promise in its mouth. §3.5 of the specification
+            // requires the three states to stay apart.
+            let exact = if reader.remaining() > 0 {
+                let approximate = reader.take_u8()? != 0;
+                let reason = reader.take_text()?;
+                Some(if approximate {
+                    Exact::No { reason }
+                } else {
+                    Exact::Yes
+                })
+            } else {
+                None
+            };
             Ok(Answer::Records {
                 records,
                 path,
                 names,
                 notes,
                 only,
+                exact,
             })
         }
         tag::VALUE => {

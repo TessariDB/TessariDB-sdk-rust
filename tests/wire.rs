@@ -16,7 +16,7 @@
 use tessaridb_client::protocol::{CEILING, GREETING, MAJOR, MINOR};
 use tessaridb_client::wire::frame::{self, Kind};
 use tessaridb_client::wire::message::decode_answers;
-use tessaridb_client::{Answer, Client, Error, Number, Request, Value};
+use tessaridb_client::{Answer, Client, Error, Exact, Number, Request, Value};
 use tokio::io::AsyncWriteExt;
 
 /// One outcome, behind the `u32` length the protocol puts in front of it.
@@ -377,11 +377,49 @@ fn a_records_outcome_from_a_node_that_predates_these_fields_reads_as_silence() {
     // it is a node with nothing to add, which is what every read was before
     // these fields existed.
     let answers = decode_answers(&answer_body(&[records_outcome(&[])])).expect("this decodes");
-    let [Answer::Records { notes, only, .. }] = answers.as_slice() else {
+    let [
+        Answer::Records {
+            notes, only, exact, ..
+        },
+    ] = answers.as_slice()
+    else {
         panic!("expected one Records outcome, got {answers:?}");
     };
     assert!(notes.is_empty());
     assert!(!*only);
+    // And the field where that rule stops. An empty note list and a node that
+    // predates notes are the same claim, so they are not told apart. Exactness
+    // is not like that: this node did not serve exact answers and forget to
+    // mention it, it said nothing, and `Some(Exact::Yes)` here would be this
+    // client inventing a promise. §3.5 requires the three states to stay apart.
+    assert!(
+        exact.is_none(),
+        "silence from an older node was read as a claim of exactness",
+    );
+}
+
+#[test]
+fn an_exactness_byte_is_read_and_the_reason_travels_with_it() {
+    let said = |approximate: bool, reason: &str| {
+        let mut tail = 0_u32.to_be_bytes().to_vec(); // no notes
+        tail.push(0); // not an ONLY read
+        tail.push(u8::from(approximate));
+        tail.extend_from_slice(&text(reason));
+        let answers =
+            decode_answers(&answer_body(&[records_outcome(&tail)])).expect("this decodes");
+        let [Answer::Records { exact, .. }] = answers.as_slice() else {
+            panic!("expected one Records outcome, got {answers:?}");
+        };
+        exact.clone()
+    };
+
+    assert_eq!(said(false, ""), Some(Exact::Yes));
+    let Some(Exact::No { reason }) = said(true, "a nearer record may exist") else {
+        panic!("an approximate answer read as exact");
+    };
+    // The node's words, not this client's. A reason derived on this side would
+    // describe a read this build did not perform.
+    assert_eq!(reason, "a nearer record may exist");
 }
 
 #[test]

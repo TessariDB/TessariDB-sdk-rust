@@ -87,7 +87,7 @@ pub use crate::geometry::{Geometry, Polygon, Position, Ring};
 pub use crate::http::{Bucket, Condition, Operations};
 pub use crate::mapping::{FromRecord, FromValue, MappingFault, Row};
 pub use crate::value::{Number, RecordId, RecordRef, Value, ValueRange};
-pub use crate::wire::message::{Answer, Names, Note, Parameters, Request};
+pub use crate::wire::message::{Answer, Exact, Names, Note, Parameters, Request};
 pub use crate::wire::push::{Became, Change, Follow};
 
 /// The protocol constants.
