@@ -16,7 +16,9 @@
 use tessaridb_client::protocol::{CEILING, GREETING, MAJOR, MINOR};
 use tessaridb_client::wire::frame::{self, Kind};
 use tessaridb_client::wire::message::decode_answers;
-use tessaridb_client::{Answer, Client, Error, Exact, Number, Request, Value};
+use tessaridb_client::{
+    Answer, Client, Correction, Error, Exact, Number, Request, Suggested, Value,
+};
 use tokio::io::AsyncWriteExt;
 
 /// One outcome, behind the `u32` length the protocol puts in front of it.
@@ -379,7 +381,11 @@ fn a_records_outcome_from_a_node_that_predates_these_fields_reads_as_silence() {
     let answers = decode_answers(&answer_body(&[records_outcome(&[])])).expect("this decodes");
     let [
         Answer::Records {
-            notes, only, exact, ..
+            notes,
+            only,
+            exact,
+            suggestion,
+            ..
         },
     ] = answers.as_slice()
     else {
@@ -395,6 +401,90 @@ fn a_records_outcome_from_a_node_that_predates_these_fields_reads_as_silence() {
     assert!(
         exact.is_none(),
         "silence from an older node was read as a claim of exactness",
+    );
+    // The suggestion is silent for a third reason again. It is not a promise
+    // this client would be inventing — a node without the field walked no
+    // dictionary, so `NotSought` would even be true of it — but `NothingNearer`
+    // would not, and that is the value a decoder reaching for a default lands on
+    // when it types this as a list.
+    assert!(
+        suggestion.is_none(),
+        "silence from an older node was read as a suggestion",
+    );
+}
+
+/// The three states a node can send, told apart.
+///
+/// The pair this exists for is `NotSought` and `NothingNearer`. They render
+/// identically to a caller that only looks at the corrections, and they are
+/// different facts: one node consulted a dictionary and found every term held,
+/// the other consulted none. A client that collapses them reports a negative the
+/// node never checked, on every read of a field with no search index — which is
+/// nearly every read.
+#[test]
+fn the_three_suggestion_states_stay_three() {
+    let said = |state: &[u8]| {
+        let mut tail = 0_u32.to_be_bytes().to_vec(); // no notes
+        tail.push(0); // not an ONLY read
+        tail.push(0); // exact
+        tail.extend_from_slice(&text("")); // with no reason to give
+        tail.extend_from_slice(state);
+        let answers =
+            decode_answers(&answer_body(&[records_outcome(&tail)])).expect("this decodes");
+        let [Answer::Records { suggestion, .. }] = answers.as_slice() else {
+            panic!("expected one Records outcome, got {answers:?}");
+        };
+        suggestion.clone()
+    };
+
+    assert_eq!(said(&[0]), Some(Suggested::NotSought));
+    assert_eq!(said(&[1]), Some(Suggested::NothingNearer));
+    assert_ne!(
+        said(&[0]),
+        said(&[1]),
+        "a dictionary nobody asked read the same as one that found everything held",
+    );
+
+    let mut corrections = vec![2_u8];
+    corrections.extend_from_slice(&1_u32.to_be_bytes());
+    corrections.extend_from_slice(&text("vecter"));
+    corrections.extend_from_slice(&text("vector"));
+    let Some(Suggested::DidYouMean(read)) = said(&corrections) else {
+        panic!("a correction read as no correction");
+    };
+    assert_eq!(
+        read,
+        vec![Correction {
+            typed: "vecter".to_owned(),
+            instead: "vector".to_owned(),
+        }],
+    );
+}
+
+/// A state byte this build has no name for reads as silence, not as an error.
+///
+/// The same contract §3.5 states for an unrecognised outcome tag and an
+/// unrecognised access path, one field further in: a newer node saying something
+/// in a vocabulary this build lacks is not a malformed answer, and refusing the
+/// whole outcome over it would make every future addition to this field a
+/// breaking change for every client already deployed.
+#[test]
+fn an_unknown_suggestion_state_reads_as_silence_rather_than_a_refusal() {
+    let mut tail = 0_u32.to_be_bytes().to_vec();
+    tail.push(0);
+    tail.push(0);
+    tail.extend_from_slice(&text(""));
+    tail.push(9); // a state from a node newer than this build
+    tail.extend_from_slice(b"whatever followed it");
+
+    let answers = decode_answers(&answer_body(&[records_outcome(&tail)]))
+        .expect("an unknown state is not a decode failure");
+    let [Answer::Records { suggestion, .. }] = answers.as_slice() else {
+        panic!("expected one Records outcome, got {answers:?}");
+    };
+    assert!(
+        suggestion.is_none(),
+        "an unfamiliar state was guessed at instead of read as silence",
     );
 }
 

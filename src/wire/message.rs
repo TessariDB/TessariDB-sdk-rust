@@ -146,6 +146,44 @@ pub enum Exact {
     },
 }
 
+/// One word the query asked for, and the word the collection holds instead.
+///
+/// `typed` is the term **after the field's analyzer ran** — lowercased, folded
+/// and stemmed — rather than the substring the reader wrote. A caller that
+/// highlights the correction inside the original query string matches on that
+/// basis or not at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Correction {
+    /// The term as the query asked for it, analyzed.
+    pub typed: String,
+    /// The nearest term the collection's dictionary holds.
+    pub instead: String,
+}
+
+/// What the node thinks the query might have meant.
+///
+/// Advice about a **different** question. The records beside this are the
+/// records the query as typed returns, and a caller that re-runs the read with a
+/// correction substituted in has asked something else: the substituted read
+/// answers with different records at an entirely plausible score, and nothing in
+/// the answer says the question changed.
+///
+/// [`Self::NotSought`] and [`Self::NothingNearer`] are the pair that must not
+/// collapse. `NothingNearer` is a claim about the collection — a dictionary was
+/// asked and holds every term the query named. `NotSought` is the absence of
+/// one, and it is what nearly every read carries, because only a search index
+/// has a dictionary at all. A caller that renders both as *no suggestions*
+/// reports a negative the node never checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Suggested {
+    /// No term dictionary was consulted for this read.
+    NotSought,
+    /// One was, and it holds every term the query named.
+    NothingNearer,
+    /// One was, and here is what it holds instead.
+    DidYouMean(Vec<Correction>),
+}
+
 /// Something a read volunteered about how it answered.
 ///
 /// A **kind and a message**, not a structure. A client's two uses are to group
@@ -174,9 +212,9 @@ pub enum Answer {
     ///
     /// Marked `#[non_exhaustive]` as well as the enum. The enum's attribute
     /// covers a new *variant*; this one covers a new *field*, and this variant
-    /// has now gained one twice — the notes and the `ONLY` flag below — because
-    /// the frame grows by appending. Without it every such addition is a
-    /// breaking change for anyone matching the fields out.
+    /// keeps gaining them — the notes, the `ONLY` flag, the exactness and the
+    /// suggestion below — because the frame grows by appending. Without it every
+    /// such addition is a breaking change for anyone matching the fields out.
     #[non_exhaustive]
     Records {
         /// What was found — identity as the node spells it, and the value.
@@ -224,6 +262,18 @@ pub enum Answer {
         /// an exact one are otherwise the same shape, the same length, and
         /// frequently the same records.
         exact: Option<Exact>,
+        /// What the node thinks the query might have meant — and `None` when it
+        /// did not say.
+        ///
+        /// The `Option` is a **fourth** state beside [`Suggested`]'s three, and
+        /// unlike `exact` above it is not a trap: a node built before this field
+        /// consulted no dictionary either, so `None` and
+        /// `Some(Suggested::NotSought)` tell a caller the same thing and differ
+        /// only in what they say about the node. They are kept apart because
+        /// that difference is the one a caller diagnosing an absent suggestion
+        /// needs — *this read asked nothing* against *this node asks nothing* —
+        /// and neither may be read as `NothingNearer`.
+        suggestion: Option<Suggested>,
     },
     /// One value, and the names of the tables it references.
     Value {
@@ -345,6 +395,36 @@ fn decode_one(reader: &mut Body<'_>) -> Result<Answer> {
             } else {
                 None
             };
+            // One state byte, and the same reason as exactness for reading its
+            // absence as silence rather than as a value: a node that predates
+            // the field never walked a dictionary, so it made no claim about one.
+            // What differs is the consequence — here silence and state `0` say
+            // the same thing to a caller, so nothing is put in an older node's
+            // mouth by reading them alike. They stay apart because they differ
+            // about the NODE, and `1` is the state neither may collapse into.
+            let suggestion = if reader.remaining() > 0 {
+                match reader.take_u8()? {
+                    0 => Some(Suggested::NotSought),
+                    1 => Some(Suggested::NothingNearer),
+                    2 => {
+                        let count = reader.take_u32()?;
+                        let mut corrections = Vec::new();
+                        for _ in 0..count {
+                            let typed = reader.take_text()?;
+                            let instead = reader.take_text()?;
+                            corrections.push(Correction { typed, instead });
+                        }
+                        Some(Suggested::DidYouMean(corrections))
+                    }
+                    // A newer node saying something in a vocabulary this build
+                    // lacks, which reads as silence rather than as a malformed
+                    // answer. The outcome's own length carries the caller past
+                    // whatever followed the byte.
+                    _ => None,
+                }
+            } else {
+                None
+            };
             Ok(Answer::Records {
                 records,
                 path,
@@ -352,6 +432,7 @@ fn decode_one(reader: &mut Body<'_>) -> Result<Answer> {
                 notes,
                 only,
                 exact,
+                suggestion,
             })
         }
         tag::VALUE => {
